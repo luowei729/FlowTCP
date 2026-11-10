@@ -1,0 +1,29 @@
+[package]
+name = "flowtcp-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FlowTCP 客户端：SOCKS5 / HTTP / HTTPS 三种入口 + 隧道复用"
+publish = false
+
+[dependencies]
+flowtcp-proto = { path = "../flowtcp-proto" }
+flowtcp-tls = { path = "../flowtcp-tls" }
+flowtcp-faketcp = { path = "../flowtcp-faketcp" }
+
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+bytes.workspace = true
+# HTTPS 入口默认自签证书需要生成密钥与证书
+rcgen.workspace = true
+time.workspace = true
+# HTTPS 入口要终止本地 TLS（浏览器 ↔ 本地代理）
+boring.workspace = true
+tokio-boring.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

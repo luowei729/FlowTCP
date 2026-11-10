@@ -1,0 +1,137 @@
+# FlowTCP CI —— 质量门禁 + 多架构交叉编译 + Release 发布
+#
+# 设计原则：
+#   1. 所有编译走 Docker，确保「本地能编 = CI 能编」
+#   2. fmt / clippy / test 作为独立 job 并行，快速失败
+#   3. 产物为 Linux amd64 + arm64（服务端只需这两个架构，见 PROJECT_PLAN）
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+# 同一分支的新提交取消旧的运行，节省 CI 配额
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 减小 CI 日志噪音，同时让 panic 带完整 backtrace
+  RUST_BACKTRACE: 1
+  RUST_LOG: info
+
+jobs:
+  # ==========================================================================
+  # Job 1: 代码格式检查（最快，几秒）
+  # ==========================================================================
+  fmt:
+    name: 格式检查 (rustfmt)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ==========================================================================
+  # Job 2: Clippy 静态检查（把警告当错误）
+  #
+  # 为什么 -D warnings：警告长期积累会让真正的问题淹没在噪音里。
+  # 本项目从零开始，一开始就保持零警告最容易。
+  # ==========================================================================
+  clippy:
+    name: 静态检查 (clippy)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ==========================================================================
+  # Job 3: 单元测试
+  #
+  # 协议核心是纯逻辑（无 IO），因此测试无需 root / TUN / 网络，
+  # 可在标准 runner 上直接跑，速度快且稳定。
+  # ==========================================================================
+  test:
+    name: 单元测试
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      - run: cargo test --workspace --release -- --nocapture
+
+  # ==========================================================================
+  # Job 4: 多架构编译 + 产物上传
+  #
+  # 关键点：
+  #   - 用 Dockerfile 的 builder 阶段，与本地构建完全一致
+  #   - arm64 依赖 QEMU 模拟（cargo 交叉编译不需要 target 工具链，
+  #     因为本项目是纯 Rust + 无 C 依赖的密码学栈）
+  #   - 产物按架构命名，供 deploy 脚本直接下载
+  # ==========================================================================
+  build:
+    name: 编译 (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    needs: [fmt, clippy, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU 让 x86 runner 能执行 arm64 容器
+      - name: 安装 QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: 安装 buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 编译 ${{ matrix.arch }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          platforms: ${{ matrix.platform }}
+          # 只构建不推送：产物通过导出拿到
+          load: false
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # 从构建镜像里把二进制取出来（builder 阶段含 target/）
+      - name: 导出二进制
+        run: |
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            --target builder \
+            --output type=local,dest=./out \
+            --cache-from type=gha,scope=${{ matrix.arch }} \
+            .
+          mkdir -p dist
+          find out -type f -name 'flowtcp*' -perm -u+x -exec cp {} dist/ \;
+          ls -lh dist/ || echo "⚠️ 本阶段尚无二进制产物（协议核心为库 crate）"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flowtcp-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 14

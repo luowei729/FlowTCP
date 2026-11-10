@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flowtcp-proto",
+    "crates/flowtcp-faketcp",
+    "crates/flowtcp-tls",
+    "crates/flowtcp-server",
+    "crates/flowtcp-client",
+    "crates/flowtcp-cli",
+]
+# vendor/ 下的 fake-tcp 是被 patch 过的第三方源码（见 vendor/fake-tcp），
+# 作为 path 依赖引入，不参与 workspace 成员管理。
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/flowtcp/flowtcp"
+
+[workspace.dependencies]
+# 异步运行时：Tokio 是 Rust 生态事实标准，SO_REUSEPORT 多线程支持成熟
+tokio = { version = "1", features = ["full"] }
+# 密码学：aes-gcm / chacha20poly1305 均为 RustCrypto 官方实现，纯 Rust 无 C 依赖
+aes = "0.8"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+# HKDF：用于从 TLS exporter 输出派生方向性密钥（RFC 5869）
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+# 随机数：rand::rngs::OsRng 走内核 CSPRNG，用于 ISN / nonce / padding
+rand = "0.9"
+# 序列化与错误处理
+thiserror = "1"
+# x25519：REALITY 式认证的 ECDH（复用 ClientHello key_share 里的临时公钥）
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# ed25519：用 ECDH 共享密钥派生临时证书的签名密钥（客户端靠它验证服务端身份）
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# p256：临时证书实际使用 ECDSA P-256（Chrome 最常见的证书类型，形态最真实，
+# 且与 Mozilla 预设的 sigalgs 完全兼容；Ed25519 在 BoringSSL 的严格预设下握手会失败）
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+# rcgen：生成自签临时证书（支持从指定 PKCS#8 私钥导入）
+rcgen = "0.13"
+# time：rcgen 用 OffsetDateTime 表示证书有效期
+time = "0.3"
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 零拷贝字节缓冲
+bytes = "1"
+# BoringSSL 绑定：这是 Chrome 使用的 TLS 实现，因此指纹天然一致。
+# 需要构建期依赖 cmake / clang / libclang-dev / libc6-dev（见 Dockerfile）。
+boring = "5"
+tokio-boring = "5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"          # thin LTO：编译时间与运行性能的平衡点
+codegen-units = 1     # 最大化跨单元优化，牺牲编译时间换性能
+panic = "abort"       # 服务端崩溃即退出，由 systemd 重启，避免 unwind 开销
+strip = true          # 去掉符号表，减小分发包体积

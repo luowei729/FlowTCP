@@ -1,0 +1,25 @@
+[package]
+name = "flowtcp-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FlowTCP 服务端：ClientHello 裁决 + 偷网站透传 + 临时证书 TLS 握手"
+
+[dependencies]
+flowtcp-proto = { path = "../flowtcp-proto" }
+flowtcp-tls = { path = "../flowtcp-tls" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# 集成测试需要生成 mock "真实网站" 的自签证书
+rcgen.workspace = true
+# 端到端测试直接用**真实客户端 API**（Tunnel/Mux/entry），
+# 而不是在测试里手搓记录层 —— 这样测的是用户真正运行的代码路径。
+# 注意：flowtcp-client 不依赖 flowtcp-server，因此这里不构成循环依赖。
+flowtcp-client = { path = "../flowtcp-client" }
+# HTTPS 入口测试需要一个"信任自签证书"的 TLS 客户端
+boring.workspace = true
+tokio-boring.workspace = true

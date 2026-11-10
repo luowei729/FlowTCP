@@ -1,0 +1,25 @@
+[package]
+name = "flowtcp-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FlowTCP 协议核心：内层帧编解码、记录层加解密、密钥派生（纯逻辑，无 IO）"
+
+[dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+x25519-dalek.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+# 基准需要直接调用 cipher 构造
+tokio.workspace = true

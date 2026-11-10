@@ -1,0 +1,17 @@
+[package]
+name = "flowtcp-faketcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FlowTCP 的 FakeTCP 承载层：用户态伪 TCP 栈 + 运行时网络自动配置（TUN + iptables）"
+
+[dependencies]
+flowtcp-proto = { path = "../flowtcp-proto" }
+# fake-tcp 使用项目内 vendored 版本（含「接受任意 ISN」补丁），
+# 见 vendor/fake-tcp/src/lib.rs 的 [FlowTCP PATCH #1]。
+fake-tcp = { path = "../../vendor/fake-tcp" }
+tokio.workspace = true
+tokio-tun = "0.23"          # 版本必须与 fake-tcp 内部使用的一致，否则 Tun 类型不通用
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,34 @@
+# === 构建产物 ===
+/target/
+dist/
+
+# 注意：vendor/ 必须进入构建上下文（被 patch 的 fake-tcp 是 path 依赖），
+# 因此这里不能排除它。
+
+# === 敏感凭证（AGENTS.md 要求的红线）===
+DEPLOY_CREDENTIALS.md
+*.pem
+*.key
+*.crt
+certs/
+.env
+.env.*
+!/.env.example
+
+# === 本地配置覆盖 ===
+*.local.toml
+config.local.toml
+
+# === 编辑器与系统 ===
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# === 测试临时文件 ===
+/tests/tmp/
+*.pcap
+*.qlog
+*.log

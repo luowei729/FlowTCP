@@ -1,0 +1,50 @@
+# === 敏感凭证（严禁提交，AGENTS.md 要求的红线）===
+DEPLOY_CREDENTIALS.md
+*.pem
+*.key
+*.crt
+certs/
+.env
+.env.*
+!/.env.example
+
+# === Rust 构建产物 ===
+/target/
+**/*.rs.bk
+# 注意：本项目是二进制程序，Cargo.lock 必须提交，故不忽略
+
+# === 发布与打包 ===
+/dist/
+/release/
+/artifacts/
+*.tar.gz
+*.tar.zst
+*.zip
+*.deb
+*.rpm
+
+# === 运行时数据（本地调试）===
+/var/
+/data/
+/run/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# === 本地配置覆盖 ===
+*.local.toml
+config.local.toml
+
+# === 编辑器与系统 ===
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# === 测试临时文件 ===
+/tests/tmp/
+*.pcap
+*.qlog

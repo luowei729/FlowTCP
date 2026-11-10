@@ -1,0 +1,22 @@
+[package]
+name = "flowtcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FlowTCP 代理传输协议 —— 统一 CLI"
+
+[[bin]]
+name = "flowtcp"
+path = "src/main.rs"
+
+[dependencies]
+flowtcp-proto = { path = "../flowtcp-proto" }
+flowtcp-tls = { path = "../flowtcp-tls" }
+flowtcp-server = { path = "../flowtcp-server" }
+flowtcp-client = { path = "../flowtcp-client" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+rand.workspace = true
