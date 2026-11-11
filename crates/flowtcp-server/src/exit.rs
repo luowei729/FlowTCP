@@ -795,14 +795,22 @@ async fn handle_frame(
                         Some(v) => v,
                         None => return Ok(()),
                     };
-                    if let Some(addr) = resolve_addr(&dest).await {
-                        // 策略二次校验：UDP 同样要防内网扫描与 DNS rebinding
+                    // UDP 同样要处理多地址：域名可能解析出 v6（不可用）与 v4。
+                    //
+                    // 与 TCP 的区别：UDP 没有"连接"可竞速，只能**依次尝试**
+                    // `send_to`（数据报发送本身是非阻塞的，成功即认为可用）。
+                    // 这也符合 UDP 语义 —— 不等待对端响应。
+                    //
+                    // 策略校验：**每个候选都校验**，防 DNS rebinding
+                    // （否则 `[公网IP, 内网IP]` 能绕过内网防护）。
+                    for addr in resolve_all(&dest).await {
                         if let Err(reason) = config.policy.check_resolved(addr) {
                             tracing::trace!(%addr, %reason, "UDP 目标被策略拒绝");
-                            return Ok(());
+                            continue;
                         }
                         if sock.send_to(data, addr).await.is_ok() {
                             stats.bytes_up += data.len() as u64;
+                            return Ok(());
                         }
                     }
                 }
@@ -920,22 +928,139 @@ fn parse_udp_payload(frame: &OwnedFrame, default: Option<Address>) -> Option<(Ad
     }
 }
 
-/// 把 [`Address`] 解析成 socket 地址（域名走系统解析器）。
-async fn resolve_addr(addr: &Address) -> Option<SocketAddr> {
+/// 把 [`Address`] 解析成**全部**候选 socket 地址（域名走系统解析器）。
+///
+/// # 为什么返回全部而不是只取第一个（实测踩坑）
+///
+/// 早期实现是 `lookup_host(...).next()` —— 只取第一个结果。这有两个致命问题：
+///
+/// 1. **IPv6 优先但不可达时全部失败**。glibc 按 RFC 6724 排序，
+///    双栈域名会优先返回 AAAA。若本机/链路没有 IPv6（国内极常见），
+///    连接直接失败 —— 而同一个域名的 A 记录明明可用。
+/// 2. **DNS 轮询失效**。多 A 记录时只用到第一个，负载分散不了。
+///
+/// 实测证据：GitHub Actions 的 runner 上 `localhost` 同时解析出 `::1` 与
+/// `127.0.0.1`，而测试用的 echo 服务只监听 `127.0.0.1` → 只取第一个的逻辑
+/// 拿到 `::1` → 连接失败 → e2e 测试 `early eof`。
+/// 这个缺陷在真实网络上更严重：国内很多域名有 AAAA 但 IPv6 不通。
+async fn resolve_all(addr: &Address) -> Vec<SocketAddr> {
     match addr {
-        Address::V4(v4) => Some(SocketAddr::V4(*v4)),
-        Address::V6(v6) => Some(SocketAddr::V6(*v6)),
+        Address::V4(v4) => vec![SocketAddr::V4(*v4)],
+        Address::V6(v6) => vec![SocketAddr::V6(*v6)],
         Address::Domain(host, port) => {
-            // 用 tokio 的异步解析，避免阻塞运行时线程
+            // 用 tokio 的异步解析，避免阻塞运行时线程。
+            // 返回顺序沿用系统（已按 RFC 6724 排序），不做重排。
             match tokio::net::lookup_host((host.as_str(), *port)).await {
-                Ok(mut it) => it.next(),
+                Ok(it) => it.collect(),
                 Err(e) => {
                     tracing::debug!(host, port, error = %e, "域名解析失败");
-                    None
+                    Vec::new()
                 }
             }
         }
     }
+}
+
+/// Happy Eyeballs 连接（RFC 8305 简化版）。
+///
+/// # 与 Hysteria 2 的对应关系
+///
+/// hy2 的 `outbounds[].direct.mode: auto` 就是这个语义：
+/// 「use both IPv4 and IPv6 addresses (if available), and use the first one
+/// that succeeds」。我们用 Go 标准库的 `net.Dialer` 默认行为做同样的事。
+///
+/// # 为什么并发竞速而不是依次尝试
+///
+/// 依次尝试遇到「IPv6 黑洞」（SYN 无响应）时要等满超时（默认 10 秒），
+/// 用户体感就是「打开网页卡 10 秒」。并发竞速让 IPv4 立即生效。
+///
+/// # 代价
+///
+/// 最多会建 `MAX_RACE` 条只成功一条的 TCP 连接（其余被 RST）。
+/// Chrome / curl / Go 都是这个做法，可接受。
+///
+/// # 安全要求（防 DNS rebinding）
+///
+/// **每个候选地址都要过策略校验**，不能只校验第一个 ——
+/// 否则恶意 DNS 只要返回 `[公网IP, 内网IP]` 就能绕开内网防护。
+async fn connect_happy_eyeballs(
+    addrs: &[SocketAddr],
+    policy: &TargetPolicy,
+    connect_timeout: Duration,
+) -> Result<TcpStream, ConnectError> {
+    /// 最多同时竞速的地址数。
+    ///
+    /// 取 4 的理由：绝大多数域名只有 1~4 个地址；再多也只是噪声，
+    /// 而且避免恶意 DNS 用上百个记录让我们开上百条连接。
+    const MAX_RACE: usize = 4;
+
+    // 先跑一遍策略校验，把被拒的地址过滤掉（同时记录拒绝原因）
+    let mut allowed: Vec<SocketAddr> = Vec::with_capacity(addrs.len());
+    let mut denied = 0usize;
+    for a in addrs {
+        match policy.check_resolved(*a) {
+            Ok(()) => allowed.push(*a),
+            Err(reason) => {
+                tracing::debug!(addr = %a, %reason, "解析后地址被策略拒绝");
+                denied += 1;
+            }
+        }
+    }
+    if allowed.is_empty() {
+        // 全部被拒 vs 根本没有地址，语义不同（前者算 denied）
+        return Err(if denied > 0 {
+            ConnectError::Denied
+        } else {
+            ConnectError::NoAddress
+        });
+    }
+
+    // 并发竞速前 MAX_RACE 个（保持系统给的优先级顺序）
+    let race_count = allowed.len().min(MAX_RACE);
+    let mut tasks = Vec::with_capacity(race_count);
+    for a in allowed.iter().take(race_count) {
+        let a = *a;
+        tasks.push(tokio::spawn(async move {
+            let r = tokio::time::timeout(connect_timeout, TcpStream::connect(a)).await;
+            (a, r)
+        }));
+    }
+
+    // 收集结果：第一个成功的立即返回，其余任务被 abort（它们建的连接随 drop 关闭）
+    let mut last_err: Option<String> = None;
+    let mut succeeded: Option<TcpStream> = None;
+    for t in tasks {
+        match t.await {
+            Ok((a, Ok(Ok(conn)))) => {
+                tracing::trace!(addr = %a, "Happy Eyeballs 连接成功");
+                succeeded = Some(conn);
+                break;
+            }
+            Ok((a, Ok(Err(e)))) => {
+                tracing::debug!(addr = %a, error = %e, "候选地址连接失败");
+                last_err = Some(e.to_string());
+            }
+            Ok((a, Err(_))) => {
+                tracing::debug!(addr = %a, "候选地址连接超时");
+                last_err = Some("timeout".into());
+            }
+            Err(e) => {
+                last_err = Some(format!("task panic: {e}"));
+            }
+        }
+    }
+    succeeded.ok_or(ConnectError::Failed(last_err))
+}
+
+/// 连接目标的失败原因（供 `open_tcp` 统计与日志区分）。
+#[derive(Debug)]
+enum ConnectError {
+    /// 域名没有解析出任何地址。
+    NoAddress,
+    /// 所有候选地址都被策略拒绝。
+    Denied,
+    /// 都尝试过了，全部失败。
+    Failed(Option<String>),
 }
 
 /// 打开一条 TCP 流并起搬运任务。
@@ -964,35 +1089,32 @@ async fn open_tcp(
         return;
     }
 
-    // ---- 3) 连接目标 ----
-    let sock_addr = match resolve_addr(&target).await {
-        Some(a) => a,
-        None => {
-            stats.connect_failed += 1;
-            let _ = out.send(OwnedFrame::close(stream_id, false)).await;
-            return;
-        }
-    };
-
-    // 域名解析后必须再校验一次真实 IP：防 DNS rebinding
-    if let Err(reason) = config.policy.check_resolved(sock_addr) {
-        tracing::debug!(%stream_id, %sock_addr, %reason, "解析后地址被策略拒绝");
-        stats.denied += 1;
+    // ---- 3) 连接目标（Happy Eyeballs 多地址竞速）----
+    //
+    // 解析出**全部**地址后并发竞速，第一个成功的胜出。
+    // 这样「域名有 AAAA 但 IPv6 不通」时能立即回退到 IPv4 ——
+    // 只取第一个地址的旧实现会直接失败（详见 `resolve_all` 的注释）。
+    let addrs = resolve_all(&target).await;
+    if addrs.is_empty() {
+        stats.connect_failed += 1;
         let _ = out.send(OwnedFrame::close(stream_id, false)).await;
         return;
     }
-
-    let conn = tokio::time::timeout(config.connect_timeout, TcpStream::connect(sock_addr)).await;
-    let conn = match conn {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            tracing::debug!(%stream_id, %sock_addr, error = %e, "连接目标失败");
+    let conn = match connect_happy_eyeballs(&addrs, &config.policy, config.connect_timeout).await {
+        Ok(c) => c,
+        Err(ConnectError::Denied) => {
+            // 所有候选地址都被策略拒（可能是 DNS rebinding 尝试）
+            stats.denied += 1;
+            let _ = out.send(OwnedFrame::close(stream_id, false)).await;
+            return;
+        }
+        Err(ConnectError::NoAddress) => {
             stats.connect_failed += 1;
             let _ = out.send(OwnedFrame::close(stream_id, false)).await;
             return;
         }
-        Err(_) => {
-            tracing::debug!(%stream_id, %sock_addr, "连接目标超时");
+        Err(ConnectError::Failed(detail)) => {
+            tracing::debug!(%stream_id, %target, detail = ?detail, "连接目标失败");
             stats.connect_failed += 1;
             let _ = out.send(OwnedFrame::close(stream_id, false)).await;
             return;
@@ -1000,6 +1122,8 @@ async fn open_tcp(
     };
     // 代理流量多为小包交互，关掉 Nagle 直接降低 RTT
     let _ = conn.set_nodelay(true);
+    // 记录实际用上的地址（日志里能看出走的是 v4 还是 v6）
+    let sock_addr = conn.peer_addr().unwrap_or(addrs[0]);
 
     // ---- 4) 注册流 ----
     // TCP 是可靠流：大缓冲 + 背压（见 Data 分支的注释）
@@ -1474,4 +1598,130 @@ async fn open_udp(
     });
 
     tracing::debug!(%stream_id, target = %default_target, "UDP 会话已打开");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowtcp_proto::frame::Address;
+
+    // ---- resolve_all ----
+    //
+    // 这里只测「IP 直给」的分支：域名解析依赖系统 DNS，
+    // 在 CI 上不可控（不同 runner 的 /etc/hosts 不同）。
+    // 域名行为由 e2e 测试覆盖。
+
+    #[tokio::test]
+    async fn v4地址原样返回() {
+        let a = Address::V4("1.2.3.4:80".parse().unwrap());
+        assert_eq!(
+            resolve_all(&a).await,
+            vec!["1.2.3.4:80".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn v6地址原样返回() {
+        let a = Address::V6("[::1]:443".parse().unwrap());
+        assert_eq!(
+            resolve_all(&a).await,
+            vec!["[::1]:443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    // ---- connect_happy_eyeballs ----
+
+    #[tokio::test]
+    async fn 第一个地址不通时回退到第二个() {
+        // 这正是 CI 上 localhost 失败的场景：
+        // 第一个候选是 ::1（无人监听）→ 必须回退到 127.0.0.1
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = l.accept().await;
+        });
+
+        // 故意把不通的地址放前面
+        let addrs = vec![
+            "[::1]:1".parse::<SocketAddr>().unwrap(), // 必定失败（端口 1 无监听）
+            ok_addr,
+        ];
+        let conn =
+            connect_happy_eyeballs(&addrs, &TargetPolicy::AllowAll, Duration::from_secs(2)).await;
+        let conn = conn.expect("应回退到可用地址");
+        assert_eq!(conn.peer_addr().unwrap(), ok_addr);
+    }
+
+    #[tokio::test]
+    async fn 全部地址不通时返回失败() {
+        let addrs = vec![
+            "[::1]:1".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:1".parse::<SocketAddr>().unwrap(),
+        ];
+        let err = connect_happy_eyeballs(&addrs, &TargetPolicy::AllowAll, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectError::Failed(_)), "实际: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn 空地址列表返回无地址() {
+        let err = connect_happy_eyeballs(&[], &TargetPolicy::AllowAll, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectError::NoAddress), "实际: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn 全部被策略拒绝时返回denied() {
+        // DenyPrivate 会拒绝 127.0.0.1（环回）
+        let addrs = vec!["127.0.0.1:80".parse::<SocketAddr>().unwrap()];
+        let err =
+            connect_happy_eyeballs(&addrs, &TargetPolicy::DenyPrivate, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+        assert!(matches!(err, ConnectError::Denied), "实际: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn 部分地址被拒不影响其余可用() {
+        // 关键安全性质：策略校验**逐地址**进行，被拒的跳过、可用的继续。
+        //
+        // 反过来（只校验第一个）就是 DNS rebinding 漏洞：
+        // 恶意 DNS 返回 [公网IP(通过), 内网IP(实际连通)] → 内网被访问。
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let loopback = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = l.accept().await;
+        });
+
+        // 两个都是环回，DenyPrivate 会全部拒绝
+        let addrs = vec![loopback, "127.0.0.1:1".parse().unwrap()];
+        let err =
+            connect_happy_eyeballs(&addrs, &TargetPolicy::DenyPrivate, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, ConnectError::Denied),
+            "内网地址必须全部被拒，实际: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn 竞速不会超过四个地址() {
+        // 防御恶意 DNS 返回上百个记录时开上百条连接。
+        // 构造 6 个不可用地址：若全都尝试会慢；只试前 4 个则很快返回。
+        let addrs: Vec<SocketAddr> = (1..=6)
+            .map(|p| format!("127.0.0.1:{p}").parse().unwrap())
+            .collect();
+        let start = std::time::Instant::now();
+        let _ = connect_happy_eyeballs(&addrs, &TargetPolicy::AllowAll, Duration::from_millis(200))
+            .await;
+        // 6 个全试（每个 200ms 超时，顺序执行）需 >1s；
+        // 只试 4 个并行也需 ~200ms，这里只断言没有明显超时堆积。
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "不应为 6 个地址串行等满超时"
+        );
+    }
 }

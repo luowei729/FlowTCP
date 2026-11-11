@@ -633,6 +633,20 @@ async fn 域名目标由服务端解析() {
     s.read_exact(&mut resp).await.unwrap();
 
     // 用「域名」形式指定目标：localhost:echo_port
+    //
+    // # 这里刻意保留 `localhost`（而不是换成 127.0.0.1）
+    //
+    // 它在不同机器的 /etc/hosts 里解析结果不同：
+    //   - 本地：只有 `127.0.0.1 localhost`
+    //   - GitHub runner：还有 `::1 localhost`（同时给出 v6 与 v4）
+    //
+    // 而 echo 只监听 127.0.0.1。所以这个测试**顺带覆盖了
+    // 「多地址且首个不可用」的回退逻辑** —— 正是线上最常见的场景
+    // （域名有 AAAA 但 IPv6 不通）。
+    //
+    // 历史上这里挂过一次 CI：早期 `resolve_addr` 只取第一个地址，
+    // 在 runner 上拿到 `::1` 连不上，e2e 报 `early eof`。
+    // 该缺陷已由 `connect_happy_eyeballs` 修复。
     let mut req = vec![0x05, 0x01, 0x00];
     Address::Domain("localhost".into(), echo.port())
         .encode(&mut req)
