@@ -44,8 +44,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 use super::EntryError;
-use crate::config::ProxyAuth;
 use crate::config::HttpsCert;
+use crate::config::ProxyAuth;
 use crate::mux::Mux;
 
 /// TLS 握手超时。

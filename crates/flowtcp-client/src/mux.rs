@@ -117,10 +117,7 @@ impl SendFlow {
             notified.as_mut().enable();
 
             {
-                let mut c = self
-                    .credit
-                    .lock()
-                    .map_err(|_| MuxError::TunnelClosed)?;
+                let mut c = self.credit.lock().map_err(|_| MuxError::TunnelClosed)?;
                 if c.available() >= n64 {
                     c.try_consume(n)
                         .map_err(|e| MuxError::Flow(e.to_string()))?;
@@ -324,14 +321,7 @@ impl Mux {
         // 退出后释放 out → 写任务收 None → shutdown，无循环依赖。
         let out_for_resend = tx.clone();
         tokio::spawn(async move {
-            read_loop(
-                reader,
-                out_for_resend,
-                ctl_rx,
-                active_for_read,
-                max_streams,
-            )
-            .await
+            read_loop(reader, out_for_resend, ctl_rx, active_for_read, max_streams).await
         });
 
         Mux {
@@ -441,7 +431,10 @@ impl Mux {
                 // 而 UDP 的价值就是「宁可丢也不要等」。
                 // cwnd 的包数上限由流控窗口反推，所以要把窗口传进去
                 let arq_tx = if reliable {
-                    Some(Arc::new(ArqSender::new(self.stream_window, self.max_payload)))
+                    Some(Arc::new(ArqSender::new(
+                        self.stream_window,
+                        self.max_payload,
+                    )))
                 } else {
                     None
                 };

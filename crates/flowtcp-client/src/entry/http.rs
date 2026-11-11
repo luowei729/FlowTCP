@@ -224,7 +224,10 @@ fn check_proxy_auth(head: &str, auth: &ProxyAuth) -> bool {
         let Some((name, val)) = line.split_once(':') else {
             continue;
         };
-        if name.trim().eq_ignore_ascii_case(PREFIX.trim_end_matches(':')) {
+        if name
+            .trim()
+            .eq_ignore_ascii_case(PREFIX.trim_end_matches(':'))
+        {
             value = Some(val.trim());
             break;
         }
@@ -524,7 +527,10 @@ mod tests {
         let req = b"CONNECT example.com:443 HTTP/1.1\r\n\
                     Proxy-Authorization: Bearer sometoken\r\n\r\n";
         let resp = raw_request(addr, req).await;
-        assert!(resp.starts_with("HTTP/1.1 407"), "只支持 Basic，其他方案应 407");
+        assert!(
+            resp.starts_with("HTTP/1.1 407"),
+            "只支持 Basic，其他方案应 407"
+        );
     }
 
     #[tokio::test]

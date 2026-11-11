@@ -187,10 +187,7 @@ async fn handle(
 ///
 /// 关键点：**配置了认证时不能同时接受 `0x00`** ——
 /// 否则任何客户端只要在方法列表里带上 `0x00` 就能绕过密码。
-async fn negotiate(
-    sock: &mut TcpStream,
-    auth: Option<&ProxyAuth>,
-) -> Result<(), EntryError> {
+async fn negotiate(sock: &mut TcpStream, auth: Option<&ProxyAuth>) -> Result<(), EntryError> {
     let mut head = [0u8; 2];
     sock.read_exact(&mut head).await?;
     if head[0] != SOCKS5 {
@@ -795,7 +792,13 @@ mod tests {
         assert!(ProxyAuth::parse("nocolon").is_err());
         assert!(ProxyAuth::parse(":pass").is_err(), "空用户名");
         assert!(ProxyAuth::parse("user:").is_err(), "空密码");
-        assert!(ProxyAuth::parse(&format!("{}:x", "u".repeat(256))).is_err(), "用户名过长");
-        assert!(ProxyAuth::parse(&format!("u:{}", "p".repeat(256))).is_err(), "密码过长");
+        assert!(
+            ProxyAuth::parse(&format!("{}:x", "u".repeat(256))).is_err(),
+            "用户名过长"
+        );
+        assert!(
+            ProxyAuth::parse(&format!("u:{}", "p".repeat(256))).is_err(),
+            "密码过长"
+        );
     }
 }

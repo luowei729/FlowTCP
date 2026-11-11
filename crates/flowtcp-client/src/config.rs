@@ -78,9 +78,7 @@ impl ProxyAuth {
     /// 因为常见密码生成器会包含它。
     pub fn parse(spec: &str) -> Result<Self, String> {
         let Some((user, pass)) = spec.split_once(':') else {
-            return Err(format!(
-                "SOCKS5 认证格式应为 用户名:密码，实际 `{spec}`"
-            ));
+            return Err(format!("SOCKS5 认证格式应为 用户名:密码，实际 `{spec}`"));
         };
         if user.is_empty() {
             return Err("SOCKS5 用户名不能为空".into());

@@ -17,7 +17,7 @@
 #
 # 用法：
 #   scripts/deploy.sh                        # 全量部署（构建 + 启动）
-#   scripts/deploy.sh build                  # 只构建
+#   scripts/deploy.sh pull                   # 只拉镜像
 #   scripts/deploy.sh start                  # 只启动
 #   scripts/deploy.sh stop                   # 停止
 #   scripts/deploy.sh status                 # 状态
@@ -49,8 +49,18 @@ SH1_SOCKS5="${SH1_SOCKS5:-0.0.0.0:1080}"
 SH1_HTTP="${SH1_HTTP:-0.0.0.0:8080}"
 SH1_HTTPS="${SH1_HTTPS:-0.0.0.0:8443}"
 
-# 镜像与容器名
-IMAGE="flowtcp:latest"
+# 镜像来源：由 GitHub Actions 构建并推送到 ghcr（双架构 manifest）
+#
+# # 为什么用 pull 而不是在服务器上构建
+#
+# sg1 是 **1 核 arm64**，从零编译 BoringSSL + Rust workspace 要 20~40 分钟，
+# 且期间机器几乎不可用。GitHub Actions 的 `ubuntu-24.04-arm` 原生 runner
+# 免费且 8 分钟内完成 —— 服务器只 pull 一个 30 MB 的镜像层，几秒钟。
+#
+# 镜像 tag：
+#   latest   跟随 main 分支最新提交
+#   sha-xxxx 精确对应某个提交（回滚用）
+IMAGE="${IMAGE:-ghcr.io/luowei729/flowtcp:latest}"
 SG1_CT="flowtcp-server"
 SH1_CT="flowtcp-client"
 
@@ -68,40 +78,19 @@ warn() { echo "${C_WARN}!${C_END} $*"; }
 err()  { echo "${C_ERR}✗${C_END} $*" >&2; }
 step() { echo; echo "${C_DIM}━━━ $* ━━━${C_END}"; }
 
-# ---- 同步源码到远端 ----
+# ---- 拉取镜像 ----
 #
-# # 为什么用 tar 管道而不是 rsync
-#
-# 实测 sg1 上没有 rsync（Debian 最小安装默认不装），而装它需要联网 apt。
-# tar 管道只依赖两端都有的基础工具，且一样能增量覆盖、一样能排除大目录。
-#
-# 排除项：
-#   target/   编译产物（各架构不同，传过去也没用，且体积巨大）
-#   .git/     版本历史（部署不需要）
-#   dist/     本地导出目录
-#   .codegraph/ 本地索引
-sync_src() {
+# `docker pull` + `docker image inspect` 双校验：pull 成功但镜像为空
+# （网络中断导致的截断）在旧版 docker 上偶有发生。
+pull_image() {
     local host="$1" user="$2" label="$3"
-    step "同步源码 → $label ($host)"
-    ssh "$user@$host" "mkdir -p /opt/flowtcp-src"
-    tar czf - -C "$REPO_DIR" \
-        --exclude='./target' \
-        --exclude='./.git' \
-        --exclude='./dist' \
-        --exclude='./.codegraph' \
-        . | ssh "$user@$host" "tar xzf - -C /opt/flowtcp-src"
-    ok "源码已同步"
-}
-
-# ---- 在远端构建镜像 ----
-#
-# 构建在远端进行（原生架构），这样产物与该机的 glibc/CPU 完全匹配。
-# 用 `--target dist` 只产出运行时镜像，跳过 ci 阶段（省一半时间）。
-build_remote() {
-    local host="$1" user="$2" label="$3"
-    step "构建镜像 → $label"
-    ssh "$user@$host" "cd /opt/flowtcp-src && docker build --target dist -t $IMAGE . 2>&1 | tail -20"
-    ok "$label 镜像构建完成"
+    step "拉取镜像 → $label"
+    ssh "$user@$host" bash -s <<EOF
+set -e
+docker pull $IMAGE 2>&1 | tail -3
+docker image inspect $IMAGE --format '  Arch: {{.Architecture}}  Size: {{.Size}}' 
+EOF
+    ok "$label 镜像就绪"
 }
 
 # ---- 启动服务端（sg1）----
@@ -184,10 +173,8 @@ do_stop() {
 
 # ---- 全量部署 ----
 do_deploy() {
-    sync_src "$SG1_HOST" "$SG1_USER" "sg1"
-    build_remote "$SG1_HOST" "$SG1_USER" "sg1"
-    sync_src "$SH1_HOST" "$SH1_USER" "sh1"
-    build_remote "$SH1_HOST" "$SH1_USER" "sh1"
+    pull_image "$SG1_HOST" "$SG1_USER" "sg1"
+    pull_image "$SH1_HOST" "$SH1_USER" "sh1"
     start_server
     start_client
     echo
@@ -214,9 +201,9 @@ EOF
 # ---- 入口 ----
 case "${1:-deploy}" in
     deploy)  do_deploy ;;
-    build)
-        sync_src "$SG1_HOST" "$SG1_USER" "sg1"; build_remote "$SG1_HOST" "$SG1_USER" "sg1"
-        sync_src "$SH1_HOST" "$SH1_USER" "sh1"; build_remote "$SH1_HOST" "$SH1_USER" "sh1"
+    pull)
+        pull_image "$SG1_HOST" "$SG1_USER" "sg1"
+        pull_image "$SH1_HOST" "$SH1_USER" "sh1"
         ;;
     start)   start_server; start_client ;;
     stop)    do_stop ;;
@@ -224,7 +211,7 @@ case "${1:-deploy}" in
     logs)    do_logs "${2:-30}" ;;
     *)
         err "未知命令：$1"
-        echo "用法：$0 {deploy|build|start|stop|status|logs [n]}"
+        echo "用法：$0 {deploy|pull|start|stop|status|logs [n]}"
         exit 1
         ;;
 esac

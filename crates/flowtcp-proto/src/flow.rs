@@ -724,8 +724,8 @@ mod tests {
     fn 未消费时不补发以免缓冲无限增长() {
         let f = FlowCounters::new(1024);
         f.on_received(1024); // 全部收到但应用还没消费
-        // 剩余 0 < 512，会进入计算，但 consumed(0) 未前进
-        // → advertised 已等于 consumed → 无新偏移可通告
+                             // 剩余 0 < 512，会进入计算，但 consumed(0) 未前进
+                             // → advertised 已等于 consumed → 无新偏移可通告
         assert!(
             f.poll_grant().is_none(),
             "应用未消费时绝不能补发，否则接收缓冲会无限增长"

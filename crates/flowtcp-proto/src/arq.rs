@@ -653,11 +653,7 @@ impl SendBuffer {
         let mut newly_acked = Vec::new();
         for &(start, end) in acks {
             // BTreeMap 的范围删除：逐个尝试（在途包少，足够快）
-            let pns: Vec<u32> = self
-                .inflight
-                .range(start..=end)
-                .map(|(k, _)| *k)
-                .collect();
+            let pns: Vec<u32> = self.inflight.range(start..=end).map(|(k, _)| *k).collect();
             for pn in pns {
                 if let Some(p) = self.inflight.remove(&pn) {
                     newly_acked.push(p);
@@ -666,15 +662,12 @@ impl SendBuffer {
         }
 
         // RTT 样本：仅当 largest_acked 是本次新确认的
-        let rtt_sample = newly_acked
-            .iter()
-            .find(|p| p.pn == new_largest)
-            .map(|p| {
-                let rtt = now_ms.saturating_sub(p.sent_at_ms) as f64;
-                // ack_delay 的单位是毫秒，与 latest_rtt 一致
-                let _ = ack_delay_ms;
-                rtt
-            });
+        let rtt_sample = newly_acked.iter().find(|p| p.pn == new_largest).map(|p| {
+            let rtt = now_ms.saturating_sub(p.sent_at_ms) as f64;
+            // ack_delay 的单位是毫秒，与 latest_rtt 一致
+            let _ = ack_delay_ms;
+            rtt
+        });
 
         (newly_acked, rtt_sample)
     }
@@ -1069,10 +1062,7 @@ impl ArqSender {
         let now = now_ms();
 
         let (loss_delay, pto_base) = match self.rtt.lock() {
-            Ok(e) => (
-                e.loss_delay_ms(),
-                e.pto_base_ms(DEFAULT_MAX_ACK_DELAY_MS),
-            ),
+            Ok(e) => (e.loss_delay_ms(), e.pto_base_ms(DEFAULT_MAX_ACK_DELAY_MS)),
             Err(_) => return Vec::new(),
         };
 
@@ -1099,9 +1089,7 @@ impl ArqSender {
         if !has_inflight {
             return Vec::new();
         }
-        let n = self
-            .pto_count
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let n = self.pto_count.load(std::sync::atomic::Ordering::Relaxed);
         // 指数退避：2^n，上限防止溢出（10 次退避 = 1024 倍，已远超任何合理场景）
         let backoff = 1u64 << n.min(10);
         let pto = pto_base.saturating_mul(backoff);
@@ -1216,12 +1204,8 @@ impl ArqSender {
         let window_cap = (self.stream_window / self.max_payload as u64).max(1) as usize;
         let cap = window_cap.clamp(MIN_CWND_PKTS, MAX_CWND_PKTS);
 
-        let acked = self
-            .acked_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let lost = self
-            .lost_total
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let acked = self.acked_total.load(std::sync::atomic::Ordering::Relaxed);
+        let lost = self.lost_total.load(std::sync::atomic::Ordering::Relaxed);
         let total = acked + lost;
 
         // 样本不足时给一个保守起点（够小，不会一下灌满窗口）
@@ -1314,7 +1298,11 @@ mod tests {
         // smoothed = 7/8*100 + 1/8*200 = 87.5 + 25 = 112.5
         // rttvar = 3/4*50 + 1/4*|100-200| = 37.5 + 25 = 62.5
         r.update(200.0, 0.0);
-        assert!((r.smoothed_rtt() - 112.5).abs() < 0.01, "{}", r.smoothed_rtt());
+        assert!(
+            (r.smoothed_rtt() - 112.5).abs() < 0.01,
+            "{}",
+            r.smoothed_rtt()
+        );
         assert!((r.rttvar() - 62.5).abs() < 0.01, "{}", r.rttvar());
     }
 
@@ -1322,7 +1310,7 @@ mod tests {
     fn ack延迟在可信时被扣除() {
         let mut r = RttEstimator::new();
         r.update(100.0, 0.0); // min_rtt = 100
-        // latest = 150, ack_delay = 20 → adjusted = 130（150 >= 100+20）
+                              // latest = 150, ack_delay = 20 → adjusted = 130（150 >= 100+20）
         r.update(150.0, 20.0);
         // smoothed = 7/8*100 + 1/8*130 = 87.5 + 16.25 = 103.75
         assert!(
@@ -1336,7 +1324,7 @@ mod tests {
     fn ack延迟过大时不扣除() {
         let mut r = RttEstimator::new();
         r.update(100.0, 0.0); // min_rtt = 100
-        // latest = 105, ack_delay = 50 → 105 < 100+50，不扣，用 105
+                              // latest = 105, ack_delay = 50 → 105 < 100+50，不扣，用 105
         r.update(105.0, 50.0);
         // smoothed = 7/8*100 + 1/8*105 = 87.5 + 13.125 = 100.625
         assert!(
@@ -1365,7 +1353,7 @@ mod tests {
     fn pto包含四倍rttvar与ack延迟() {
         let mut r = RttEstimator::new();
         r.update(100.0, 0.0); // smoothed=100, rttvar=50
-        // PTO = 100 + max(200, 1) + 25 = 325
+                              // PTO = 100 + max(200, 1) + 25 = 325
         assert_eq!(r.pto_base_ms(25), 325);
     }
 
@@ -1533,7 +1521,7 @@ mod tests {
         s.on_sent(frame(0, b"a"), 0);
         s.on_sent(frame(1, b"b"), 0);
         s.on_sent(frame(2, b"c"), 500); // 最新
-        // 只确认 2（0,1 未被确认，但包阈值不够：2-0=2 < 3）
+                                        // 只确认 2（0,1 未被确认，但包阈值不够：2-0=2 < 3）
         s.on_ack(&[(2, 2)], 0, 500);
         // 时间阈值 100ms：现在 500ms，包在 0ms 发 → 500-0=500 > 100 → 判丢
         let lost = s.detect_lost(500, 100);
@@ -1548,7 +1536,7 @@ mod tests {
             s.on_sent(frame(pn, b"x"), 0);
         }
         s.on_ack(&[(0, 1)], 0, 1000); // 只确认 0,1
-        // 时间阈值极大 + 现在时间很晚，但 2,3,4 > largest_acked(1)
+                                      // 时间阈值极大 + 现在时间很晚，但 2,3,4 > largest_acked(1)
         let lost = s.detect_lost(100_000, 1);
         assert!(lost.is_empty(), "比 largest_acked 新的包绝不能判丢");
     }
@@ -1732,8 +1720,10 @@ mod tests {
     fn 丢包率越高窗口越小() {
         let mk = |acked: u64, lost: u64| {
             let a = arq();
-            a.acked_total.store(acked, std::sync::atomic::Ordering::Relaxed);
-            a.lost_total.store(lost, std::sync::atomic::Ordering::Relaxed);
+            a.acked_total
+                .store(acked, std::sync::atomic::Ordering::Relaxed);
+            a.lost_total
+                .store(lost, std::sync::atomic::Ordering::Relaxed);
             a.cwnd()
         };
         let c0 = mk(10_000, 0);

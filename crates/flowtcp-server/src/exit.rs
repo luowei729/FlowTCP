@@ -41,12 +41,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flowtcp_proto::arq::{now_ms, AckRanges, ArqReceiver, ArqSender};
+use flowtcp_proto::flow::{decode_window_credit, encode_window_credit, FlowCounters, SendCredit};
 use flowtcp_proto::frame::{Address, Flags, FrameType, OwnedFrame, FRAME_HEADER_LEN};
 use flowtcp_proto::record::{Keys, RecordDecoder, RecordEncoder};
-use flowtcp_proto::arq::{now_ms, AckRanges, ArqReceiver, ArqSender};
-use flowtcp_proto::flow::{
-    decode_window_credit, encode_window_credit, FlowCounters, SendCredit,
-};
 use flowtcp_proto::{SlotTable, MAX_RECORD_PLAINTEXT};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -1058,7 +1056,13 @@ async fn open_tcp(
         arq_tx_for_fin.on_sent(fin_frame.clone());
         let _ = out_clone.send(fin_frame).await;
         // FIN 也可能被丢：等它被确认后再注销（超时保护 5 秒）
-        wait_arq_drain(&arq_tx_for_fin, &out_clone, stream_id, Duration::from_secs(5)).await;
+        wait_arq_drain(
+            &arq_tx_for_fin,
+            &out_clone,
+            stream_id,
+            Duration::from_secs(5),
+        )
+        .await;
         // 通道可能已关闭（隧道断了），此时无需再通知
         let _ = cleanup.send(stream_id).await;
     });

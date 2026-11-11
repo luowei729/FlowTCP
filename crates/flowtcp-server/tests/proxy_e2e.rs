@@ -432,7 +432,9 @@ async fn https入口默认自签证书可用() {
     let cert = flowtcp_client::HttpsCert::default();
     let mux_for_entry = Arc::clone(&mux);
     let entry =
-        tokio::spawn(async move { https_entry::serve_on(listener, mux_for_entry, &cert, None).await });
+        tokio::spawn(
+            async move { https_entry::serve_on(listener, mux_for_entry, &cert, None).await },
+        );
 
     // ---- 本地 TLS 客户端（信任自签，因为这是本机链路）----
     let mut connector = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();

@@ -167,14 +167,20 @@ fn thread_seed() -> u32 {
     use std::hash::{BuildHasher, Hasher};
     // RandomState 每次构造都带随机密钥，用它算一个 hash 即可
     let mut h = RandomState::new().build_hasher();
-    h.write_u64(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E37_79B9));
+    h.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9),
+    );
     // 高并发下多个线程可能在同一纳秒取种子，再加线程 id 混合
     h.write_u64(thread_id_hash());
     let v = h.finish() as u32;
-    if v == 0 { 0x1234_5678 } else { v }
+    if v == 0 {
+        0x1234_5678
+    } else {
+        v
+    }
 }
 
 /// 线程标识的哈希（`ThreadId::as_u64` 仍是 unstable，用 Debug 表示求 hash）。

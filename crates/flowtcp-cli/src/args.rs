@@ -142,7 +142,9 @@ impl Args {
         let Some(raw) = self.get(key) else {
             return Ok(None);
         };
-        parse_bytes(raw).map(Some).map_err(|e| format!("--{key} {e}"))
+        parse_bytes(raw)
+            .map(Some)
+            .map_err(|e| format!("--{key} {e}"))
     }
 }
 
