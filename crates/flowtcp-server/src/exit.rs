@@ -1015,26 +1015,41 @@ async fn connect_happy_eyeballs(
         });
     }
 
-    // 并发竞速前 MAX_RACE 个（保持系统给的优先级顺序）
-    let race_count = allowed.len().min(MAX_RACE);
-    let mut tasks = Vec::with_capacity(race_count);
-    for a in allowed.iter().take(race_count) {
+    // 并发竞速前 MAX_RACE 个（保持系统给的优先级顺序）。
+    //
+    // ★ 必须用 `JoinSet`，**不能**用 `Vec<JoinHandle>` + 顺序 `await`。
+    //
+    // 这里踩过一个很隐蔽的坑：任务虽然已经 spawn（真的并发执行），
+    // 但用
+    // ```ignore
+    // for t in tasks { t.await }   // ← 错
+    // ```
+    // 收集结果时，`await` 是**按数组顺序**逐个等的。
+    // 第一个候选若是「IPv6 黑洞」（SYN 无响应），就要等满 `connect_timeout`
+    // 才轮到第二个 —— 而第二个（IPv4）其实早就成功了。
+    //
+    // 实测症状：直连 sg1 访 google 是 57 ms，经代理却固定 **10.2 秒**
+    // （正好等于 connect_timeout）后失败。google/youtube/telegram
+    // 都是 IPv6 优先的域名，所以全部中招；github 有 A 记录在前就正常。
+    //
+    // `JoinSet::join_next` 返回**任意一个已完成**的任务，正是竞速语义。
+    let mut set = tokio::task::JoinSet::new();
+    for a in allowed.iter().take(allowed.len().min(MAX_RACE)) {
         let a = *a;
-        tasks.push(tokio::spawn(async move {
+        set.spawn(async move {
             let r = tokio::time::timeout(connect_timeout, TcpStream::connect(a)).await;
             (a, r)
-        }));
+        });
     }
 
-    // 收集结果：第一个成功的立即返回，其余任务被 abort（它们建的连接随 drop 关闭）
     let mut last_err: Option<String> = None;
-    let mut succeeded: Option<TcpStream> = None;
-    for t in tasks {
-        match t.await {
+    // JoinSet 在 drop 时会 abort 所有未完成任务，
+    // 所以「第一个成功就返回」时，其余正在进行的连接会自动取消。
+    while let Some(res) = set.join_next().await {
+        match res {
             Ok((a, Ok(Ok(conn)))) => {
                 tracing::trace!(addr = %a, "Happy Eyeballs 连接成功");
-                succeeded = Some(conn);
-                break;
+                return Ok(conn);
             }
             Ok((a, Ok(Err(e)))) => {
                 tracing::debug!(addr = %a, error = %e, "候选地址连接失败");
@@ -1049,7 +1064,7 @@ async fn connect_happy_eyeballs(
             }
         }
     }
-    succeeded.ok_or(ConnectError::Failed(last_err))
+    Err(ConnectError::Failed(last_err))
 }
 
 /// 连接目标的失败原因（供 `open_tcp` 统计与日志区分）。
@@ -1704,6 +1719,44 @@ mod tests {
         assert!(
             matches!(err, ConnectError::Denied),
             "内网地址必须全部被拒，实际: {err:?}"
+        );
+    }
+
+    /// ★ 回归测试：竞速必须是**并发**的，不能按数组顺序逐个引用。
+    ///
+    /// 曾经的实现用 `Vec<JoinHandle>` + 顺序 `await`：
+    /// 任务确实并发 spawn 了，但收集时先等第一个。
+    /// 若第一个是「IPv6 黑洞」（SYN 无响应），就要等满 `connect_timeout`
+    /// 才轮到早已成功的第二个。
+    ///
+    /// 实测症状：直连 sg1 访 google 57 ms，经代理固定 10.2 秒失败。
+    #[tokio::test]
+    async fn 竞速不受首个地址黑洞影响() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = l.accept().await;
+        });
+
+        // 第一个地址是「黑洞」：不可路由，SYN 得不到任何响应
+        // （用 TEST-NET-1 网段 192.0.2.0/24，RFC 5737 规定不可用于真实主机）
+        let blackhole: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let addrs = vec![blackhole, ok_addr];
+
+        let start = std::time::Instant::now();
+        let conn = connect_happy_eyeballs(
+            &addrs,
+            &TargetPolicy::AllowAll,
+            Duration::from_secs(10), // 故意给足超时：若顺序等待，这里会等满 10s
+        )
+        .await
+        .expect("应连上可用地址");
+
+        assert_eq!(conn.peer_addr().unwrap(), ok_addr);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "竞速必须并发：耗时 {:?}，说明在顺序等第一个地址",
+            start.elapsed()
         );
     }
 
