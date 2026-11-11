@@ -103,7 +103,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # 非 root 运行：即使被攻破也无法修改系统
 RUN useradd -r -u 10001 -s /usr/sbin/nologin flowtcp
 WORKDIR /app
-COPY --from=builder /build/target/release/flowtcp* /app/ 2>/dev/null || true
+# ★ 必须写确切路径，不能写 `flowtcp* /app/ 2>/dev/null || true`。
+#
+# Docker 的 `COPY` **不支持 shell 重定向与 `||`** —— 那串字符会被当成
+# 多个源路径的一部分，构建时报：
+#   ERROR: failed to calculate checksum ... "/app": not found
+#
+# 而且「文件不存在也继续」本来就不该要：二进制缺失说明 builder 阶段出了问题，
+# 应该在构建期硬失败，而不是产出一个启动就报错（或跑空）的镜像。
+COPY --from=builder /build/target/release/flowtcp /app/flowtcp
 ENTRYPOINT ["/app/flowtcp"]
 
 # ============================================================================
