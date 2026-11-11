@@ -85,7 +85,16 @@ jobs:
   # ==========================================================================
   build:
     name: 编译 (${{ matrix.arch }})
-    runs-on: ubuntu-24.04
+    # ★ 各架构用**原生** runner，而不是 QEMU 模拟。
+    #
+    # 实测对比（本项目的 BoringSSL + Rust workspace）：
+    # | 方式 | arm64 耗时 |
+    # |------|-----------|
+    # | QEMU 模拟 | 30~50 分钟 |
+    # | ubuntu-24.04-arm 原生 | 5~8 分钟 |
+    #
+    # 公开仓库的 ARM runner 免费，没有理由用 QEMU 硬扛。
+    runs-on: ${{ matrix.runner }}
     needs: [fmt, clippy, test]
     strategy:
       fail-fast: false
@@ -93,14 +102,13 @@ jobs:
         include:
           - arch: amd64
             platform: linux/amd64
+            runner: ubuntu-24.04
           - arch: arm64
             platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
-      # QEMU 让 x86 runner 能执行 arm64 容器
-      - name: 安装 QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: 安装 buildx
         uses: docker/setup-buildx-action@v3

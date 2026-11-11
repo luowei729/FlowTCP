@@ -199,7 +199,7 @@ async fn socks5_tcp_connect_echo往返() {
 
     let listener = socks5_bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let proxy = listener.local_addr().unwrap();
-    let entry = tokio::spawn(socks5_entry::serve_on(listener, Arc::clone(&mux)));
+    let entry = tokio::spawn(socks5_entry::serve_on(listener, Arc::clone(&mux), None));
 
     // ---- 标准 SOCKS5 客户端 ----
     let mut s = TcpStream::connect(proxy).await.unwrap();
@@ -259,7 +259,7 @@ async fn socks5_udp_associate_双向与切目标() {
 
     let listener = socks5_bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let proxy = listener.local_addr().unwrap();
-    let entry = tokio::spawn(socks5_entry::serve_on(listener, Arc::clone(&mux)));
+    let entry = tokio::spawn(socks5_entry::serve_on(listener, Arc::clone(&mux), None));
 
     // ---- TCP 控制连接：UDP ASSOCIATE ----
     let mut ctrl = TcpStream::connect(proxy).await.unwrap();
@@ -340,7 +340,7 @@ async fn http_connect建立隧道() {
         .await
         .unwrap();
     let proxy = listener.local_addr().unwrap();
-    let entry = tokio::spawn(http_entry::serve_on(listener, Arc::clone(&mux)));
+    let entry = tokio::spawn(http_entry::serve_on(listener, Arc::clone(&mux), None));
 
     let mut s = TcpStream::connect(proxy).await.unwrap();
     let req =
@@ -386,7 +386,7 @@ async fn http绝对uri被改写为origin_form() {
         .await
         .unwrap();
     let proxy = listener.local_addr().unwrap();
-    let entry = tokio::spawn(http_entry::serve_on(listener, Arc::clone(&mux)));
+    let entry = tokio::spawn(http_entry::serve_on(listener, Arc::clone(&mux), None));
 
     let mut s = TcpStream::connect(proxy).await.unwrap();
     // 绝对 URI 形式（浏览器走明文 HTTP 时就是这样发的）
@@ -432,7 +432,7 @@ async fn https入口默认自签证书可用() {
     let cert = flowtcp_client::HttpsCert::default();
     let mux_for_entry = Arc::clone(&mux);
     let entry =
-        tokio::spawn(async move { https_entry::serve_on(listener, mux_for_entry, &cert).await });
+        tokio::spawn(async move { https_entry::serve_on(listener, mux_for_entry, &cert, None).await });
 
     // ---- 本地 TLS 客户端（信任自签，因为这是本机链路）----
     let mut connector = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
@@ -487,7 +487,7 @@ async fn 单隧道并发多流互不干扰() {
 
     let listener = socks5_bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let proxy = listener.local_addr().unwrap();
-    let entry = tokio::spawn(socks5_entry::serve_on(listener, Arc::clone(&mux)));
+    let entry = tokio::spawn(socks5_entry::serve_on(listener, Arc::clone(&mux), None));
 
     // 并发 8 条连接，各自 echo 不同内容
     let mut tasks = Vec::new();
@@ -623,7 +623,7 @@ async fn 域名目标由服务端解析() {
 
     let listener = socks5_bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let proxy = listener.local_addr().unwrap();
-    let entry = tokio::spawn(socks5_entry::serve_on(listener, Arc::clone(&mux)));
+    let entry = tokio::spawn(socks5_entry::serve_on(listener, Arc::clone(&mux), None));
 
     let mut s = TcpStream::connect(proxy).await.unwrap();
     s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();

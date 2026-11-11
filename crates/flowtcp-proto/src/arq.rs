@@ -123,8 +123,15 @@ pub const DEFAULT_MAX_ACK_DELAY_MS: u64 = 25;
 /// （上限可到 2048 包 ≈ 2.8 MB）。当前先固定保守值，保证高丢包下不卡死。
 pub const MIN_CWND_PKTS: usize = 32;
 
-/// 在途包数下限 / 上限。
-pub const MAX_CWND_PKTS: usize = 2048;
+/// 在途包数的**内存**硬上限（与流控窗口无关的最终兜底）。
+///
+/// 正常情况下 `cwnd` 的上限由「流控窗口 / 单帧大小」决定（见
+/// [`ArqSender::cwnd`]）—— 那才是真正的「在途数据量」上限。
+/// 这个常量只是防御：若用户把 `--stream-window` 调到荒谬的值
+/// （例如 1 GB），也不能让在途帧缓存吃掉几 GB 内存。
+///
+/// 8192 × 1400 B ≈ **11 MB/流**，配合连接级窗口上限足够安全。
+pub const MAX_CWND_PKTS: usize = 8192;
 
 /// ACK 帧最多携带的范围数。
 ///
@@ -740,6 +747,11 @@ impl SendBuffer {
         self.inflight.values().next()
     }
 
+    /// 最老的 `n` 个未确认包（PTO 探测用，RFC 9002 §6.2.4 允许发两个）。
+    pub fn oldest_n_inflight(&self, n: usize) -> Vec<&SentPacket> {
+        self.inflight.values().take(n).collect()
+    }
+
     /// 记录一次重传（同时把原包从在途移除）。
     pub fn on_retransmit(&mut self, pn: u32) {
         self.inflight.remove(&pn);
@@ -929,6 +941,11 @@ impl std::error::Error for ArqError {}
 /// 两者跑在不同任务里，所以用 `Arc` + `Mutex`。
 /// **锁只保护纯内存结构，绝不跨 `await` 持有** —— 否则会拖慢热路径。
 pub struct ArqSender {
+    /// 流控窗口（字节）。`cwnd` 的包数上限由它反推：
+    /// `window / max_payload` —— 这样任意 RTT 下都能把窗口用满。
+    stream_window: u64,
+    /// 单帧最大 payload（用于把窗口字节数换算成包数）。
+    max_payload: usize,
     /// 在途包 + 丢包检测。
     send: std::sync::Mutex<SendBuffer>,
     /// RTT 估计（PTO 与时间阈值都依赖它）。
@@ -944,16 +961,27 @@ pub struct ArqSender {
     lost_total: std::sync::atomic::AtomicU64,
 }
 
-impl Default for ArqSender {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ArqSender {
-    /// 新建（无可观状态，序号从 0 开始）。
-    pub fn new() -> Self {
+    /// 用流控窗口与单帧大小构造。
+    ///
+    /// # 为什么需要这两个参数
+    ///
+    /// `cwnd`（在途包数上限）应该等于「流控窗口能装下多少包」：
+    ///
+    /// ```text
+    /// cwnd ≤ stream_window / max_payload
+    /// ```
+    ///
+    /// 这样在途**字节数**就天然不超过窗口大小 —— 不会为了 ARQ 额外吃内存，
+    /// 同时任意 RTT 下都能把窗口用满（高 BDP 链路只需调大 `--stream-window`）。
+    ///
+    /// 早期实现把上限硬编码成 2048 包（≈2.8 MB），结果：
+    /// - 8 MB 窗口只用得到 2.8 MB → 浪费 65%
+    /// - RTT 200 ms 线路上 2048 包只能跑 `2048×1400/0.2 ≈ 14 MB/s`
+    pub fn new(stream_window: u64, max_payload: usize) -> Self {
         ArqSender {
+            stream_window,
+            max_payload: max_payload.max(1),
             send: std::sync::Mutex::new(SendBuffer::new()),
             rtt: std::sync::Mutex::new(RttEstimator::new()),
             next_seq: std::sync::atomic::AtomicU32::new(0),
@@ -1093,20 +1121,32 @@ impl ArqSender {
         self.pto_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // 取最老的未确认包作为探测
-        let probe = match self.send.lock() {
-            Ok(b) => b.oldest_inflight().map(|p| p.frame.clone()),
-            Err(_) => None,
+        // 取最老的**两个**未确认包作为探测。
+        //
+        // RFC 9002 §6.2.4：
+        //   "An endpoint MAY send up to two full-sized datagrams containing
+        //    ack-eliciting packets to avoid an expensive consecutive PTO
+        //    expiration due to a single lost datagram"
+        //
+        // 只发 1 个时，若那个探测包又丢了，就要等下一次 PTO（已翻倍）。
+        // 实测严重丢包（30%）下，发 2 个能把恢复速度提升近一倍。
+        let probes = match self.send.lock() {
+            Ok(b) => b
+                .oldest_n_inflight(2)
+                .into_iter()
+                .map(|p| p.frame.clone())
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
         };
-        match probe {
-            Some(f) => {
-                if let Ok(mut b) = self.send.lock() {
-                    b.on_retransmit(f.pkt_seq);
-                }
-                vec![f]
-            }
-            None => Vec::new(),
+        if probes.is_empty() {
+            return Vec::new();
         }
+        if let Ok(mut b) = self.send.lock() {
+            for f in &probes {
+                b.on_retransmit(f.pkt_seq);
+            }
+        }
+        probes
     }
 
     /// 把判定丢失的包**复用原序号**重传。
@@ -1164,7 +1204,18 @@ impl ArqSender {
     /// 与 Hysteria 的 Brutal 一致：**丢包不作为拥塞信号**。
     /// 我们的丢包主要来自链路 QoS / 人为注入，减小窗口只会让吞吐更低，
     /// 不会让链路变好。所以只按实测丢包率**设定上限**，不做退让。
+    ///
+    /// # 两个上限（取较小者）
+    ///
+    /// 1. **ACK 容量**：`0.8 × MAX_ACK_RANGES / 丢包率` —— 硬约束
+    /// 2. **窗口容量**：`stream_window / max_payload` —— 在途字节不超过窗口
+    ///
+    /// 低丢包时上限 2 生效（窗口用满），高丢包时上限 1 生效（保证 ACK 能覆盖）。
     pub fn cwnd(&self) -> usize {
+        // 上限 2：窗口能装下的包数
+        let window_cap = (self.stream_window / self.max_payload as u64).max(1) as usize;
+        let cap = window_cap.clamp(MIN_CWND_PKTS, MAX_CWND_PKTS);
+
         let acked = self
             .acked_total
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1173,16 +1224,17 @@ impl ArqSender {
             .load(std::sync::atomic::Ordering::Relaxed);
         let total = acked + lost;
 
-        // 样本不足时用初始值（避免开局抖动）
+        // 样本不足时给一个保守起点（够小，不会一下灌满窗口）
         if total < 100 {
-            return MIN_CWND_PKTS * 4;
+            return (MIN_CWND_PKTS * 4).min(cap);
         }
 
         let loss_rate = (lost as f64 / total as f64).max(0.005);
-        // 目标：在途包数不超 `MAX_ACK_RANGES * 0.8` 个乱序段
+        // 上限 1：在途包数不超 `MAX_ACK_RANGES * 0.8` 个乱序段
         let budget = MAX_ACK_RANGES as f64 * 0.8;
-        let limit = (budget / loss_rate) as usize;
-        limit.clamp(MIN_CWND_PKTS, MAX_CWND_PKTS)
+        let ack_cap = (budget / loss_rate) as usize;
+
+        ack_cap.clamp(MIN_CWND_PKTS, cap)
     }
 
     /// 是否还能再发（在途包数是否已达动态窗口）。
@@ -1611,30 +1663,36 @@ mod tests {
 
     // ---- 动态拥塞窗口 ----
 
+    /// 测试用构造：8 MB 窗口 + 1400 字节帧。
+    fn arq() -> ArqSender {
+        ArqSender::new(8 * 1024 * 1024, 1400)
+    }
+
     #[test]
     fn 样本不足时用初始窗口() {
-        let a = ArqSender::new();
+        let a = arq();
         assert_eq!(a.cwnd(), MIN_CWND_PKTS * 4, "无样本时不应激进放大");
     }
 
     #[test]
-    fn 无丢包时窗口放大到上限() {
-        let a = ArqSender::new();
+    fn 无丢包时窗口放大到窗口容量() {
+        let a = arq();
         a.acked_total
             .store(10_000, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(a.cwnd(), MAX_CWND_PKTS, "零丢包应放到最大窗口");
+        // 8 MB / 1400 = 5991 包，未触及 MAX_CWND_PKTS(8192)
+        assert_eq!(a.cwnd(), 8 * 1024 * 1024 / 1400, "零丢包应放到窗口容量");
     }
 
     #[test]
     fn 高丢包时窗口收缩以控制乱序段数() {
-        let a = ArqSender::new();
+        let a = arq();
         // 30% 丢包：3000 acked + 1286 lost ≈ 30%
         a.acked_total
             .store(3000, std::sync::atomic::Ordering::Relaxed);
         a.lost_total
             .store(1286, std::sync::atomic::Ordering::Relaxed);
         let cwnd = a.cwnd();
-        assert!(cwnd < MAX_CWND_PKTS, "高丢包必须收缩，实际 {cwnd}");
+        assert!(cwnd < 8 * 1024 * 1024 / 1400, "高丢包必须收缩，实际 {cwnd}");
         assert!(cwnd >= MIN_CWND_PKTS);
 
         // ★ 核心不变量：在途包 × 丢包率 必须能装进一个 ACK 帧
@@ -1647,9 +1705,33 @@ mod tests {
     }
 
     #[test]
+    fn 大窗口下cwnd随窗口放大而不是固定值() {
+        // 关键性质：高 BDP 链路只需调大 --stream-window，
+        // cwnd 就自动放大（早期硬编码 2048 时完全做不到）
+        let small = ArqSender::new(1024 * 1024, 1400);
+        let large = ArqSender::new(32 * 1024 * 1024, 1400);
+        for a in [&small, &large] {
+            a.acked_total
+                .store(10_000, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(small.cwnd(), 1024 * 1024 / 1400);
+        assert_eq!(large.cwnd(), MAX_CWND_PKTS, "32 MB 窗口应撞内存兜底上限");
+        assert!(large.cwnd() > small.cwnd() * 4);
+    }
+
+    #[test]
+    fn 超大窗口不突破内存兜底() {
+        // 防御：用户把 --stream-window 调到 1 GB 也不能吃爆内存
+        let a = ArqSender::new(1024 * 1024 * 1024, 1400);
+        a.acked_total
+            .store(10_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(a.cwnd(), MAX_CWND_PKTS);
+    }
+
+    #[test]
     fn 丢包率越高窗口越小() {
         let mk = |acked: u64, lost: u64| {
-            let a = ArqSender::new();
+            let a = arq();
             a.acked_total.store(acked, std::sync::atomic::Ordering::Relaxed);
             a.lost_total.store(lost, std::sync::atomic::Ordering::Relaxed);
             a.cwnd()

@@ -55,6 +55,12 @@ pub async fn run(args: &Args) -> Result<(), String> {
     if let Some(n) = args.u16_of("max-streams")? {
         cfg.max_streams = n;
     }
+    // 代理入口认证（三个入口共用）：--proxy-auth user:pass
+    if let Some(spec) = args.get("proxy-auth") {
+        let auth = flowtcp_client::ProxyAuth::parse(spec)
+            .map_err(|e| format!("--proxy-auth 无效: {e}"))?;
+        cfg.proxy_auth = Some(auth);
+    }
     if let Some(secs) = args.u64_of("connect-timeout")? {
         cfg.connect_timeout = std::time::Duration::from_secs(secs);
     }
@@ -135,6 +141,9 @@ HTTPS 入口证书:
 
 其他:
   --max-streams <N>      单隧道最大并发流数，默认 256
+  --proxy-auth U:P       启用代理认证（三个入口共用）
+                         例：--proxy-auth admin:abcd1234
+                         SOCKS5 走 RFC 1929，HTTP/HTTPS 走 Basic（407 挑战）
   --stream-window <SIZE> 单流流控窗口，默认 8M（支持 512K / 8M / 16M）
                          **必须与服务端一致**。高延迟链路调大，
                          小内存设备调小（如 2M）

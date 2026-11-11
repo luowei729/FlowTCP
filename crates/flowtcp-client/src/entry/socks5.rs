@@ -40,6 +40,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use super::EntryError;
+use crate::config::ProxyAuth;
 use crate::mux::Mux;
 
 /// SOCKS 版本号。
@@ -51,6 +52,20 @@ const CMD_BIND: u8 = 0x02;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
 
 /// 应答码。
+/// 认证方法（RFC 1928 §3）。
+const METHOD_NO_AUTH: u8 = 0x00;
+/// 用户名/密码认证（RFC 1929）。
+const METHOD_USERPASS: u8 = 0x02;
+/// 无可接受的方法。
+const METHOD_NONE: u8 = 0xFF;
+
+/// RFC 1929 子协商版本号。
+const AUTH_VERSION: u8 = 0x01;
+/// RFC 1929 认证成功。
+const AUTH_OK: u8 = 0x00;
+/// RFC 1929 认证失败。
+const AUTH_FAIL: u8 = 0x01;
+
 const REP_SUCCESS: u8 = 0x00;
 const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
@@ -63,9 +78,13 @@ const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// SOCKS5 监听循环。
-pub async fn serve(addr: SocketAddr, mux: Arc<Mux>) -> Result<(), EntryError> {
+pub async fn serve(
+    addr: SocketAddr,
+    mux: Arc<Mux>,
+    auth: Option<Arc<ProxyAuth>>,
+) -> Result<(), EntryError> {
     let listener = bind(addr).await?;
-    serve_on(listener, mux).await
+    serve_on(listener, mux, auth).await
 }
 
 /// 只完成绑定（供测试拿到实际端口后再 `serve_on`）。
@@ -76,9 +95,17 @@ pub async fn bind(addr: SocketAddr) -> Result<TcpListener, EntryError> {
 }
 
 /// 在已绑定的 listener 上跑监听循环。
-pub async fn serve_on(listener: TcpListener, mux: Arc<Mux>) -> Result<(), EntryError> {
+pub async fn serve_on(
+    listener: TcpListener,
+    mux: Arc<Mux>,
+    auth: Option<Arc<ProxyAuth>>,
+) -> Result<(), EntryError> {
     let actual = listener.local_addr()?;
-    tracing::info!(%actual, "SOCKS5 正在监听");
+    if auth.is_some() {
+        tracing::info!(%actual, "SOCKS5 正在监听（已启用用户名/密码认证）");
+    } else {
+        tracing::info!(%actual, "SOCKS5 正在监听");
+    }
 
     loop {
         let (sock, peer) = match listener.accept().await {
@@ -92,8 +119,9 @@ pub async fn serve_on(listener: TcpListener, mux: Arc<Mux>) -> Result<(), EntryE
         let _ = sock.set_nodelay(true);
 
         let m = Arc::clone(&mux);
+        let a = auth.clone();
         tokio::spawn(async move {
-            match handle(sock, m, actual).await {
+            match handle(sock, m, actual, a).await {
                 Ok((up, down)) => {
                     tracing::debug!(%peer, up, down, "SOCKS5 连接结束");
                 }
@@ -110,11 +138,19 @@ async fn handle(
     mut sock: TcpStream,
     mux: Arc<Mux>,
     listen_addr: SocketAddr,
+    auth: Option<Arc<ProxyAuth>>,
 ) -> Result<(u64, u64), EntryError> {
     // ---- 1) 方法协商 ----
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, negotiate(&mut sock))
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, negotiate(&mut sock, auth.as_deref()))
         .await
         .map_err(|_| EntryError::Protocol("SOCKS5 方法协商超时".into()))??;
+
+    // ---- 1.5) 用户名密码认证（仅当配置了）----
+    if let Some(a) = auth.as_deref() {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate(&mut sock, a))
+            .await
+            .map_err(|_| EntryError::Protocol("SOCKS5 认证超时".into()))??;
+    }
 
     // ---- 2) 读请求 ----
     let req = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_request(&mut sock))
@@ -140,14 +176,21 @@ async fn handle(
     }
 }
 
-/// 方法协商：只接受「无认证」。
+/// 方法协商（RFC 1928 §3）。
 ///
-/// # 为什么不做用户名/密码认证
+/// # 两种模式
 ///
-/// 本地入口监听在 `127.0.0.1`（或用户明确指定的内网地址），
-/// 使用者就是本机用户，再加一层密码只会让配置变复杂而不增加安全性。
-/// 若确实需要，应在系统层用防火墙限制来源。
-async fn negotiate(sock: &mut TcpStream) -> Result<(), EntryError> {
+/// | 配置 | 通告方法 | 客户端必须选 |
+/// |------|---------|-------------|
+/// | 无认证 | `0x00` | `0x00` |
+/// | 有认证 | **只回 `0x02`** | `0x02`，否则回 `0xFF` 断开 |
+///
+/// 关键点：**配置了认证时不能同时接受 `0x00`** ——
+/// 否则任何客户端只要在方法列表里带上 `0x00` 就能绕过密码。
+async fn negotiate(
+    sock: &mut TcpStream,
+    auth: Option<&ProxyAuth>,
+) -> Result<(), EntryError> {
     let mut head = [0u8; 2];
     sock.read_exact(&mut head).await?;
     if head[0] != SOCKS5 {
@@ -165,15 +208,87 @@ async fn negotiate(sock: &mut TcpStream) -> Result<(), EntryError> {
     let mut methods = vec![0u8; n];
     sock.read_exact(&mut methods).await?;
 
-    // 0x00 = 无认证。若客户端不支持，按 RFC 应回 0xFF
-    if !methods.contains(&0x00) {
-        sock.write_all(&[SOCKS5, 0xFF]).await?;
-        return Err(EntryError::Protocol(
-            "客户端不支持无认证方法（本代理仅支持 0x00）".into(),
-        ));
-    }
-    sock.write_all(&[SOCKS5, 0x00]).await?;
+    // 服务端选择它支持的方法（RFC 1928：由服务端决定，不是客户端）
+    let chosen = match auth {
+        Some(_) => {
+            if !methods.contains(&METHOD_USERPASS) {
+                sock.write_all(&[SOCKS5, METHOD_NONE]).await?;
+                return Err(EntryError::Protocol(
+                    "客户端不支持用户名/密码认证（本代理要求认证）".into(),
+                ));
+            }
+            METHOD_USERPASS
+        }
+        None => {
+            if !methods.contains(&METHOD_NO_AUTH) {
+                sock.write_all(&[SOCKS5, METHOD_NONE]).await?;
+                return Err(EntryError::Protocol(
+                    "客户端不支持无认证方法（本代理未配置认证）".into(),
+                ));
+            }
+            METHOD_NO_AUTH
+        }
+    };
+    sock.write_all(&[SOCKS5, chosen]).await?;
     Ok(())
+}
+
+/// RFC 1929 用户名/密码子协商。
+///
+/// # 报文格式
+///
+/// ```text
+/// 客户端 → 服务端：VER(1)=0x01  ULEN(1)  UNAME(1~255)
+///                 PLEN(1)      PASSWD(1~255)
+/// 服务端 → 客户端：VER(1)=0x01  STATUS(1)   0x00=成功  其他=失败
+/// ```
+///
+/// # 两个安全细节
+///
+/// 1. **常量时间比较**：用 `ct_eq` 逐字节异或累加，不提前 return。
+///    普通 `==` 会在第一个不同字节处返回，泄漏「前几字节正确」的信息。
+///    虽然这是本地入口，但既然做认证就做对。
+/// 2. **失败后立即断开**：认证失败不回任何后续应答（RFC 1929 要求
+///    服务端在发送失败状态后**必须**关闭连接）。
+async fn authenticate(sock: &mut TcpStream, auth: &ProxyAuth) -> Result<(), EntryError> {
+    // ---- 读版本 + 用户名 ----
+    let mut v = [0u8; 1];
+    sock.read_exact(&mut v).await?;
+    if v[0] != AUTH_VERSION {
+        // 版本不对也要把剩下的字节读完再回失败，否则对方会收到 RST
+        let _ = sock.write_all(&[AUTH_VERSION, AUTH_FAIL]).await;
+        return Err(EntryError::Protocol(format!(
+            "SOCKS5 认证版本异常 0x{:02X}",
+            v[0]
+        )));
+    }
+    let mut ulen = [0u8; 1];
+    sock.read_exact(&mut ulen).await?;
+    let mut uname = vec![0u8; ulen[0] as usize];
+    sock.read_exact(&mut uname).await?;
+
+    // ---- 读密码 ----
+    let mut plen = [0u8; 1];
+    sock.read_exact(&mut plen).await?;
+    let mut passwd = vec![0u8; plen[0] as usize];
+    sock.read_exact(&mut passwd).await?;
+
+    // ---- 校验（常量时间）----
+    let user_ok = super::ct_eq(&uname, auth.username.as_bytes());
+    let pass_ok = super::ct_eq(&passwd, auth.password.as_bytes());
+    // 用位与而非 `&&`：两者都要算完，不短路
+    let ok = user_ok & pass_ok;
+
+    if ok {
+        sock.write_all(&[AUTH_VERSION, AUTH_OK]).await?;
+        tracing::debug!("SOCKS5 认证通过");
+        Ok(())
+    } else {
+        sock.write_all(&[AUTH_VERSION, AUTH_FAIL]).await?;
+        // 认证失败 = 可能被暴力破解，记 warn 便于排查
+        tracing::warn!("SOCKS5 认证失败（用户名或密码错误）");
+        Err(EntryError::Protocol("SOCKS5 认证失败".into()))
+    }
 }
 
 /// 已解析的 SOCKS5 请求。
@@ -494,7 +609,7 @@ mod tests {
     async fn serve_accept_once(l: TcpListener, mux: Arc<Mux>) {
         let (sock, _) = l.accept().await.unwrap();
         let addr = sock.local_addr().unwrap();
-        let _ = handle(sock, mux, addr).await;
+        let _ = handle(sock, mux, addr, None).await;
     }
 
     #[tokio::test]
@@ -531,5 +646,156 @@ mod tests {
         if r.is_ok() {
             assert_eq!(head[1], REP_ATYP_NOT_SUPPORTED);
         }
+    }
+
+    // ---- RFC 1929 用户名/密码认证 ----
+
+    /// 启动一个启用认证的 SOCKS5 服务端，返回监听地址。
+    async fn serve_with_auth(user: &str, pass: &str) -> (SocketAddr, Arc<ProxyAuth>) {
+        let (client, _server) = crate::testutil::tunnel_pair();
+        let mux = Arc::new(Mux::spawn(client, 8, 1400));
+        let l = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let auth = Arc::new(ProxyAuth {
+            username: user.to_string(),
+            password: pass.to_string(),
+        });
+        let a = Arc::clone(&auth);
+        tokio::spawn(async move { serve_on(l, mux, Some(a)).await });
+        (addr, auth)
+    }
+
+    #[tokio::test]
+    async fn 启用认证后只通告用户密码方法() {
+        let (addr, _) = serve_with_auth("admin", "abcd1234").await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        // 客户端声明同时支持「无认证」和「用户密码」
+        s.write_all(&[SOCKS5, 2, METHOD_NO_AUTH, METHOD_USERPASS])
+            .await
+            .unwrap();
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await.unwrap();
+        // 服务端必须选 0x02 —— 绝不能因为客户端也支持 0x00 就放行
+        assert_eq!(
+            resp,
+            [SOCKS5, METHOD_USERPASS],
+            "启用认证后必须强制选择用户名密码，否则无认证可绕过"
+        );
+    }
+
+    #[tokio::test]
+    async fn 正确凭据认证通过() {
+        let (addr, _) = serve_with_auth("admin", "abcd1234").await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+
+        s.write_all(&[SOCKS5, 1, METHOD_USERPASS]).await.unwrap();
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [SOCKS5, METHOD_USERPASS]);
+
+        // 子协商
+        let mut msg = vec![AUTH_VERSION, 5];
+        msg.extend_from_slice(b"admin");
+        msg.push(8);
+        msg.extend_from_slice(b"abcd1234");
+        s.write_all(&msg).await.unwrap();
+
+        let mut r = [0u8; 2];
+        s.read_exact(&mut r).await.unwrap();
+        assert_eq!(r, [AUTH_VERSION, AUTH_OK], "正确凭据应认证成功");
+    }
+
+    #[tokio::test]
+    async fn 错误密码被拒绝() {
+        let (addr, _) = serve_with_auth("admin", "abcd1234").await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+
+        s.write_all(&[SOCKS5, 1, METHOD_USERPASS]).await.unwrap();
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await.unwrap();
+
+        let mut msg = vec![AUTH_VERSION, 5];
+        msg.extend_from_slice(b"admin");
+        msg.push(8);
+        msg.extend_from_slice(b"wrongpwd");
+        s.write_all(&msg).await.unwrap();
+
+        let mut r = [0u8; 2];
+        s.read_exact(&mut r).await.unwrap();
+        assert_eq!(r, [AUTH_VERSION, AUTH_FAIL], "错误密码必须失败");
+
+        // 失败后服务端应关闭连接（读应返回 0 或错误）
+        let mut buf = [0u8; 1];
+        let n = s.read(&mut buf).await.unwrap_or(0);
+        assert_eq!(n, 0, "认证失败后服务端必须关闭连接");
+    }
+
+    #[tokio::test]
+    async fn 错误用户名被拒绝() {
+        let (addr, _) = serve_with_auth("admin", "abcd1234").await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+
+        s.write_all(&[SOCKS5, 1, METHOD_USERPASS]).await.unwrap();
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await.unwrap();
+
+        let mut msg = vec![AUTH_VERSION, 5];
+        msg.extend_from_slice(b"other");
+        msg.push(8);
+        msg.extend_from_slice(b"abcd1234");
+        s.write_all(&msg).await.unwrap();
+
+        let mut r = [0u8; 2];
+        s.read_exact(&mut r).await.unwrap();
+        assert_eq!(r, [AUTH_VERSION, AUTH_FAIL]);
+    }
+
+    #[tokio::test]
+    async fn 客户端不支持认证时回ff() {
+        let (addr, _) = serve_with_auth("admin", "abcd1234").await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        // 只声明支持「无认证」
+        s.write_all(&[SOCKS5, 1, METHOD_NO_AUTH]).await.unwrap();
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await.unwrap();
+        assert_eq!(
+            resp,
+            [SOCKS5, METHOD_NONE],
+            "客户端不支持认证时应回 0xFF 拒绝"
+        );
+    }
+
+    #[tokio::test]
+    async fn 未配置认证时仍接受无认证() {
+        let (client, _server) = crate::testutil::tunnel_pair();
+        let mux = Arc::new(Mux::spawn(client, 8, 1400));
+        let l = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { serve_on(l, mux, None).await });
+
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(&[SOCKS5, 1, METHOD_NO_AUTH]).await.unwrap();
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [SOCKS5, METHOD_NO_AUTH]);
+    }
+
+    #[test]
+    fn 认证凭据解析() {
+        let a = ProxyAuth::parse("admin:abcd1234").unwrap();
+        assert_eq!(a.username, "admin");
+        assert_eq!(a.password, "abcd1234");
+
+        // 密码里允许冒号（只按第一个冒号切分）
+        let b = ProxyAuth::parse("user:p:a:ss").unwrap();
+        assert_eq!(b.username, "user");
+        assert_eq!(b.password, "p:a:ss");
+
+        // 各种非法输入
+        assert!(ProxyAuth::parse("nocolon").is_err());
+        assert!(ProxyAuth::parse(":pass").is_err(), "空用户名");
+        assert!(ProxyAuth::parse("user:").is_err(), "空密码");
+        assert!(ProxyAuth::parse(&format!("{}:x", "u".repeat(256))).is_err(), "用户名过长");
+        assert!(ProxyAuth::parse(&format!("u:{}", "p".repeat(256))).is_err(), "密码过长");
     }
 }

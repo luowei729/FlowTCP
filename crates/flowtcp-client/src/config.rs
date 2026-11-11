@@ -42,6 +42,66 @@ impl Default for HttpsCert {
     }
 }
 
+/// SOCKS5 用户名/密码认证（RFC 1929）。
+///
+/// # 为什么本地入口也需要认证
+///
+/// 默认监听 `127.0.0.1` 时确实不需要（使用者就是本机用户）。
+/// 但部署到服务器上做**公共入口**时（例如给团队/客户共享一个 SOCKS5），
+/// 监听地址往往是 `0.0.0.0`，此时无认证等于把出口完全开放。
+///
+/// # 与 FlowTCP 隧道密码的区别
+///
+/// | 凭据 | 作用范围 |
+/// |------|---------|
+/// | `--password`（隧道密码） | 客户端 ↔ 服务端之间的协议认证 |
+/// | `--socks5-auth`（本项） | 上层应用 ↔ 本地 SOCKS5 入口 |
+///
+/// 两者独立：隧道密码泄露不影响本地入口，反之亦然。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyAuth {
+    /// 用户名（1~255 字节）。
+    pub username: String,
+    /// 密码（1~255 字节）。
+    pub password: String,
+}
+
+impl ProxyAuth {
+    /// 用 `用户:密码` 形式构造。
+    ///
+    /// # 为什么用冒号分隔而不是两个参数
+    ///
+    /// 对齐业界习惯（`curl -x socks5://user:pass@host:port`、
+    /// `socks5://user:pass@` URI 都是这个形式），且命令行只需记一个参数。
+    ///
+    /// **密码里允许含冒号**（只按第一个冒号切分），
+    /// 因为常见密码生成器会包含它。
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let Some((user, pass)) = spec.split_once(':') else {
+            return Err(format!(
+                "SOCKS5 认证格式应为 用户名:密码，实际 `{spec}`"
+            ));
+        };
+        if user.is_empty() {
+            return Err("SOCKS5 用户名不能为空".into());
+        }
+        if pass.is_empty() {
+            return Err("SOCKS5 密码不能为空".into());
+        }
+        // RFC 1929 规定 ULEN/PASSWD 都是 1 字节长度，故上限 255
+        if user.len() > 255 {
+            return Err(format!("SOCKS5 用户名过长（{} > 255 字节）", user.len()));
+        }
+        if pass.len() > 255 {
+            return Err(format!("SOCKS5 密码过长（{} > 255 字节）", pass.len()));
+        }
+        Ok(ProxyAuth {
+            username: user.to_string(),
+            password: pass.to_string(),
+        })
+    }
+}
+
 /// 各入口监听地址。
 ///
 /// 全部为 `Option`：只要至少启用一个即可。默认只开 SOCKS5
@@ -89,6 +149,11 @@ pub struct ClientConfig {
     pub entries: EntryAddrs,
     /// HTTPS 入口的证书来源。
     pub https_cert: HttpsCert,
+    /// SOCKS5 入口的用户名密码认证（`None` = 无认证）。
+    ///
+    /// 仅对 SOCKS5 入口生效；HTTP/HTTPS 入口暂不支持认证
+    /// （它们通常只监听回环，且浏览器对代理认证的体验很差）。
+    pub proxy_auth: Option<ProxyAuth>,
     /// 单条隧道允许的最大并发流数。
     ///
     /// 取 256 的理由：浏览器单站点并发 6~10，256 足够覆盖多标签页；
@@ -107,6 +172,7 @@ impl ClientConfig {
             sni: sni.into(),
             entries: EntryAddrs::default(),
             https_cert: HttpsCert::default(),
+            proxy_auth: None,
             max_streams: 256,
             connect_timeout: std::time::Duration::from_secs(10),
         }
@@ -127,6 +193,12 @@ impl ClientConfig {
     /// 设置 HTTPS 入口。
     pub fn with_https(mut self, addr: SocketAddr) -> Self {
         self.entries.https = Some(addr);
+        self
+    }
+
+    /// 设置 SOCKS5 用户名密码认证。
+    pub fn with_proxy_auth(mut self, auth: ProxyAuth) -> Self {
+        self.proxy_auth = Some(auth);
         self
     }
 

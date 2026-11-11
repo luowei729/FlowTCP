@@ -439,8 +439,9 @@ impl Mux {
                 //
                 // 给 UDP 加重传会让丢包变延迟（重传要等 RTT），
                 // 而 UDP 的价值就是「宁可丢也不要等」。
+                // cwnd 的包数上限由流控窗口反推，所以要把窗口传进去
                 let arq_tx = if reliable {
-                    Some(Arc::new(ArqSender::new()))
+                    Some(Arc::new(ArqSender::new(self.stream_window, self.max_payload)))
                 } else {
                     None
                 };

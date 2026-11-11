@@ -1013,7 +1013,8 @@ async fn open_tcp(
     let recv_flow = Arc::new(FlowCounters::new(config.stream_window));
 
     // ARQ 状态：TCP 流可靠（有 ACK + 重传），与 Hysteria 2 一致。
-    let arq_tx = Arc::new(ArqSender::new());
+    // cwnd 的包数上限由流控窗口反推（见 `ArqSender::cwnd`）。
+    let arq_tx = Arc::new(ArqSender::new(config.stream_window, config.max_payload));
     let arq_rx = ArqReceiver::new(config.stream_window);
 
     streams.insert(

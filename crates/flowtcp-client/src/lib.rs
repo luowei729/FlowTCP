@@ -64,7 +64,7 @@ pub mod tunnel;
 #[cfg(test)]
 mod testutil;
 
-pub use config::{ClientConfig, EntryAddrs, HttpsCert};
+pub use config::{ClientConfig, EntryAddrs, HttpsCert, ProxyAuth};
 pub use mux::{Mux, StreamHandle};
 pub use transport::{TcpTransport, Transport};
 pub use tunnel::{Tunnel, TunnelError};

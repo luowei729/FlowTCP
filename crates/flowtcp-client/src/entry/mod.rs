@@ -27,6 +27,30 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::config::ClientConfig;
 use crate::mux::{Mux, MuxError, StreamHandle};
 
+/// 常量时间字节比较（认证凭据校验专用）。
+///
+/// # 为什么不能直接用 `==`
+///
+/// `==` 在第一个不同字节处就返回，攻击者可以通过测量响应时间
+/// 逐字节猜出正确凭据（时序侧信道）。认证路径必须用常量时间比较。
+///
+/// 实现：长度不等直接返回 false（长度本身不是秘密），
+/// 否则逐字节异或累加，**不提前返回** —— 耗时只与长度相关。
+#[inline]
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    let mut i = 0;
+    while i < a.len() {
+        acc |= a[i] ^ b[i];
+        i += 1;
+    }
+    acc == 0
+}
+
+pub mod base64;
 pub mod http;
 pub mod https;
 pub mod socks5;
@@ -57,28 +81,40 @@ pub enum EntryError {
 pub async fn run_all(mux: Arc<Mux>, config: ClientConfig) -> Result<(), EntryError> {
     let mut tasks = Vec::new();
 
+    // 三个入口共用同一份认证凭据（`--proxy-auth user:pass`）。
+    //
+    // # 为什么共用一个凭据而不是三个独立参数
+    //
+    // 用户配置的是"谁能用这个代理"，而不是"谁能用哪个端口的代理"。
+    // 三份独立凭据只会增加配置负担和出错概率（改了 socks5 忘了改 http）。
+    // 若将来真需要分别控制，再扩展成 `--socks5-auth` / `--http-auth` 即可。
+    let auth = config.proxy_auth.clone().map(Arc::new);
+
     if let Some(addr) = config.entries.socks5 {
         let m = Arc::clone(&mux);
+        let a = auth.clone();
         tasks.push(tokio::spawn(async move {
             tracing::info!(%addr, "SOCKS5 入口启动（TCP CONNECT + UDP ASSOCIATE）");
-            socks5::serve(addr, m).await
+            socks5::serve(addr, m, a).await
         }));
     }
 
     if let Some(addr) = config.entries.http {
         let m = Arc::clone(&mux);
+        let a = auth.clone();
         tasks.push(tokio::spawn(async move {
             tracing::info!(%addr, "HTTP 代理入口启动（CONNECT + 绝对 URI）");
-            http::serve(addr, m).await
+            http::serve(addr, m, a).await
         }));
     }
 
     if let Some(addr) = config.entries.https {
         let m = Arc::clone(&mux);
         let cert = config.https_cert.clone();
+        let a = auth.clone();
         tasks.push(tokio::spawn(async move {
             tracing::info!(%addr, "HTTPS 代理入口启动（HTTP over TLS）");
-            https::serve(addr, m, &cert).await
+            https::serve(addr, m, &cert, a).await
         }));
     }
 

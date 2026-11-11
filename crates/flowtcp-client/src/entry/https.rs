@@ -44,6 +44,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 use super::EntryError;
+use crate::config::ProxyAuth;
 use crate::config::HttpsCert;
 use crate::mux::Mux;
 
@@ -57,9 +58,14 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const SELF_SIGNED_VALIDITY_DAYS: i64 = 3650;
 
 /// HTTPS 代理监听循环。
-pub async fn serve(addr: SocketAddr, mux: Arc<Mux>, cert: &HttpsCert) -> Result<(), EntryError> {
+pub async fn serve(
+    addr: SocketAddr,
+    mux: Arc<Mux>,
+    cert: &HttpsCert,
+    auth: Option<Arc<ProxyAuth>>,
+) -> Result<(), EntryError> {
     let listener = bind(addr).await?;
-    serve_on(listener, mux, cert).await
+    serve_on(listener, mux, cert, auth).await
 }
 
 /// 只完成绑定（供测试拿到实际端口后再 `serve_on`）。
@@ -74,6 +80,7 @@ pub async fn serve_on(
     listener: TcpListener,
     mux: Arc<Mux>,
     cert: &HttpsCert,
+    auth: Option<Arc<ProxyAuth>>,
 ) -> Result<(), EntryError> {
     // ---- 1) 准备证书 ----
     let tls_cfg = build_config(cert)?;
@@ -85,6 +92,7 @@ pub async fn serve_on(
             HttpsCert::SelfSigned { .. } => "自签",
             HttpsCert::Files { .. } => "指定文件",
         },
+        auth = auth.is_some(),
         "HTTPS 代理正在监听"
     );
 
@@ -99,6 +107,7 @@ pub async fn serve_on(
         let _ = sock.set_nodelay(true);
         let m = Arc::clone(&mux);
         let cfg = tls_cfg.clone();
+        let a = auth.clone();
 
         tokio::spawn(async move {
             // ---- 2) 终止本地 TLS ----
@@ -130,7 +139,7 @@ pub async fn serve_on(
             };
 
             // ---- 3) 复用 HTTP 代理逻辑 ----
-            match super::http::handle(tls, m).await {
+            match super::http::handle(tls, m, a).await {
                 Ok((up, down)) => tracing::debug!(%peer, up, down, "HTTPS 代理连接结束"),
                 Err(e) => tracing::debug!(%peer, error = %e, "HTTPS 代理连接错误"),
             }

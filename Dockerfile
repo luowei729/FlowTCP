@@ -60,6 +60,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         lld \
  && rm -rf /var/lib/apt/lists/*
 
+# ★ vendor/ 必须在 `cargo chef cook` **之前**复制。
+#
+# `flowtcp-faketcp` 通过 `[patch]` 依赖 `vendor/fake-tcp`（path 依赖）。
+# 若 cook 阶段没有这个目录，cargo 解析依赖会直接失败：
+#   `failed to get fake-tcp as a dependency ... No such file or directory`
+#
+# 这个坑在本地开发时看不到（本地 target/ 已有缓存），
+# 只有在全新容器里从零 cook 才会暴露 —— 属于「CI 才炸」的典型。
+COPY vendor ./vendor
 COPY --from=planner /build/recipe.json recipe.json
 # 只编译依赖，不编译本项目代码 → 缓存友好
 RUN cargo chef cook --release --recipe-path recipe.json
@@ -68,8 +77,22 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY vendor ./vendor
-RUN cargo build --release --workspace \
- && cargo test --release --workspace
+# ★ 这里**不跑** `cargo test`。
+#
+# 早期写法是 `cargo build --release --workspace && cargo test --release --workspace`，
+# 想“构建时就保证正确”。但它有两个严重副作用：
+#
+# 1. **双倍编译**：`cargo test` 会重新编译所有 crate 的 test profile
+#    （带 `cfg(test)` 的额外代码），arm64 单核下多花 5~10 分钟。
+# 2. **无法分层缓存**：test 与 build 混在同一 RUN 里，
+#    改一行代码就要重跑全部测试。
+#
+# 正确分工：
+# - **CI 的 `test` job** 负责跑测试（`ubuntu-24.04` + 缓存，几十秒）
+# - **镜像构建** 只负责产出可运行二进制
+#
+# 镜像构建前的质量门禁由 workflow 的 `needs:` 保证（test 通过才构建镜像）。
+RUN cargo build --release --workspace
 
 # ============================================================================
 # 阶段 4：导出二进制（用于 CI artifact 与本地 dist 目录）
