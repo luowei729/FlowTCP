@@ -1206,19 +1206,41 @@ impl ArqSender {
 
         let acked = self.acked_total.load(std::sync::atomic::Ordering::Relaxed);
         let lost = self.lost_total.load(std::sync::atomic::Ordering::Relaxed);
-        let total = acked + lost;
 
-        // 样本不足时给一个保守起点（够小，不会一下灌满窗口）
-        if total < 100 {
-            return (MIN_CWND_PKTS * 4).min(cap);
+        // ---- 有丢包：按 ACK 帧容量约束收缩 ----
+        //
+        // 乱序段数 ≈ 在途包数 × 丢包率，必须装进一个 Ack 帧（MAX_ACK_RANGES 段），
+        // 否则最老的段被截断 → 发送端反复重传（见 `MAX_ACK_RANGES` 的实测数据）。
+        if lost > 0 {
+            let total = (acked + lost).max(1);
+            let loss_rate = (lost as f64 / total as f64).max(0.005);
+            let ack_cap = (MAX_ACK_RANGES as f64 * 0.8 / loss_rate) as usize;
+            return ack_cap.clamp(MIN_CWND_PKTS, cap);
         }
 
-        let loss_rate = (lost as f64 / total as f64).max(0.005);
-        // 上限 1：在途包数不超 `MAX_ACK_RANGES * 0.8` 个乱序段
-        let budget = MAX_ACK_RANGES as f64 * 0.8;
-        let ack_cap = (budget / loss_rate) as usize;
-
-        ack_cap.clamp(MIN_CWND_PKTS, cap)
+        // ---- 无丢包：慢启动 ----
+        //
+        // ★ 这里必须随「已确认量」增长，不能用一个固定的初始值。
+        //
+        // 曾经的实现返回固定 `MIN_CWND_PKTS * 4`（128 包 ≈ 179 KB）。
+        // 在 RTT 214 ms 的跨国链路上：
+        //   吞吐上限 = 179 KB / 0.214 s ≈ **0.84 MB/s**
+        // 而 sh1 ↔ sg1 的 BDP = 200 Mbps × 0.214 s ≈ **5.35 MB**（约 3800 包）。
+        // 差 30 倍 —— 实测经代理下载只有几百 KB/s，就是被这个卡死的。
+        //
+        // 正确做法是照抄 QUIC 慢启动（RFC 9002 §7.3.1）：
+        //   「cwnd increases by the number of bytes acknowledged」
+        // 换算成包数就是「每确认 1 包，窗口加 1 包」→ 每个 RTT 翻倍。
+        //
+        // 与 Brutal 的关系：Brutal 用 `cwnd = bps × RTT × 2 / ackRate` 直接算出
+        // 窗口，因为它有用户填写的 `bps`。我们没有带宽配置，所以用「慢启动
+        // 探测」等价地逼近 BDP —— 两者最终都收敛到 ≈ 2×BDP。
+        //
+        // 从 `kInitialWindow`（QUIC 推荐 10 包）起步而非 0：
+        // 太小会让首字节延迟变差（要等好几个 RTT 才发得出数据）。
+        const INITIAL_WINDOW_PKTS: u64 = 10;
+        let grown = INITIAL_WINDOW_PKTS.saturating_add(acked);
+        (grown as usize).clamp(MIN_CWND_PKTS, cap)
     }
 
     /// 是否还能再发（在途包数是否已达动态窗口）。
@@ -1657,9 +1679,66 @@ mod tests {
     }
 
     #[test]
-    fn 样本不足时用初始窗口() {
+    fn 无样本时用初始窗口() {
         let a = arq();
-        assert_eq!(a.cwnd(), MIN_CWND_PKTS * 4, "无样本时不应激进放大");
+        // 慢启动起点：kInitialWindow(10) 但被 MIN_CWND_PKTS(32) 托底
+        assert_eq!(a.cwnd(), MIN_CWND_PKTS, "开局不应一下灌满窗口");
+    }
+
+    /// ★ 回归测试：cwnd 必须随已确认量增长（慢启动）。
+    ///
+    /// 曾经的实现返回固定 128 包 ≈ 179 KB。在 RTT 214 ms 的跨国链路上
+    /// 吞吐上限只有 `179 KB / 0.214 s ≈ 0.84 MB/s`，而 BDP 需要约 3800 包
+    /// （200 Mbps × 0.214 s ≈ 5.35 MB）—— 差 30 倍，实测下载只有几百 KB/s。
+    #[test]
+    fn 无丢包时随已确认量增长到窗口上限() {
+        let a = ArqSender::new(8 * 1024 * 1024, 1400);
+        let cap = 8 * 1024 * 1024 / 1400; // ≈ 5991 包
+
+        // 开局
+        assert_eq!(a.cwnd(), MIN_CWND_PKTS);
+
+        // 确认 100 包 → 窗口应涨到 ~110（而不是卡在 128 或某个固定值）
+        a.acked_total
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(a.cwnd(), 110, "每确认 1 包窗口加 1 包");
+
+        // 确认 2000 包 → 2000 + 10
+        a.acked_total
+            .store(2000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(a.cwnd(), 2010);
+
+        // 确认 10000 包 → 撞窗口上限（8 MB / 1400 ≈ 5991）
+        a.acked_total
+            .store(10_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(a.cwnd(), cap, "增长不得超过流控窗口");
+    }
+
+    /// 慢启动必须能在合理时间收敛到 BDP（否则高 RTT 链路上吞吐上不去）。
+    ///
+    /// 指数增长：每 RTT 翻倍。从 32 包到 5991 包需 log2(5991/32) ≈ 7.5 个 RTT。
+    /// RTT 214 ms 时约 **1.6 秒**收敛 —— 用户几乎感知不到。
+    #[test]
+    fn 慢启动收敛到高bdp所需时间可接受() {
+        let a = ArqSender::new(8 * 1024 * 1024, 1400);
+        let cap = 8 * 1024 * 1024 / 1400;
+
+        // 模拟慢启动：每个 RTT 内确认量约等于当前 cwnd，窗口翻倍
+        let mut acked = 0u64;
+        let mut rounds = 0;
+        loop {
+            a.acked_total
+                .store(acked, std::sync::atomic::Ordering::Relaxed);
+            let w = a.cwnd();
+            if w >= cap || rounds > 30 {
+                break;
+            }
+            acked += w as u64; // 一个 RTT 确认掉整个窗口
+            rounds += 1;
+        }
+        assert!(rounds <= 12, "收敛用了 {rounds} 个 RTT，过长");
+        // RTT 214 ms 下 12 RTT = 2.6 秒，可接受
+        assert!(rounds as f64 * 0.214 < 3.0);
     }
 
     #[test]
